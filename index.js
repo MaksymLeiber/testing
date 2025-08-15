@@ -2230,8 +2230,8 @@ input[type=number] {
     this._stopHttpFallback();
     this._stopLatencyMonitoring();
     this._unbindSocket();
-    // Отписка от live логов
-    try { if (this.logs) { this.logs.unsubscribe(); } } catch(_) {}
+    // Отписка от live логов и очистка обработчиков
+    try { if (this.logs) { this.logs.unsubscribe(); this.logs.cleanup(); } } catch(_) {}
 
     // Полностью удаляем панель из DOM при закрытии
     try { if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root); } catch(_) {}

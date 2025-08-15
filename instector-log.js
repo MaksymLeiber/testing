@@ -6,11 +6,17 @@ export class ServerInspectorLogs {
     this.main = mainInspector; // reference to parent ServerInspector
     // move state from main as needed (still referencing main's settings for now)
     this._onLogsBatch = null;
+    this._bound = false;
+    this._eventHandlers = new Map(); // Store event handlers for proper cleanup
   }
 
   // Initialization from index after panel build
   initializeAfterBuild() {
-    try { this.bindPanel(); } catch (e) {}
+    try { 
+      if (this.main && this.main.els) {
+        this.bindPanel(); 
+      }
+    } catch (e) {}
     try { this.ensureBackgroundSubscription(); } catch (e) {}
   }
 
@@ -19,10 +25,49 @@ export class ServerInspectorLogs {
     this.els = els;
   }
 
+  // Clean up event handlers properly
+  cleanup() {
+    try {
+      // Remove all stored event handlers
+      this._eventHandlers.forEach((handlerInfo, element) => {
+        if (element && element.removeEventListener && handlerInfo) {
+          try {
+            element.removeEventListener(handlerInfo.event, handlerInfo.handler);
+          } catch(_) {}
+        }
+      });
+      this._eventHandlers.clear();
+      
+      // Clean up socket handlers
+      if (this._onLogsBatch && window.socket) {
+        window.socket.off('log_record_batch', this._onLogsBatch);
+        this._onLogsBatch = null;
+        if (window.socket._logsHandlerBound) {
+          window.socket._logsHandlerBound = false;
+        }
+      }
+      
+      this._bound = false;
+    } catch(_) {}
+  }
+
+  // Helper method to safely add event listeners with cleanup tracking
+  _addEventListener(element, event, handler) {
+    if (!element || !element.addEventListener) return;
+    element.addEventListener(event, handler);
+    // Store handler with event type for proper cleanup
+    this._eventHandlers.set(element, { handler, event });
+  }
+
   // --- Implementations migrated from index.js ---
   bindPanel() {
     const self = this.main;
-    if (this._bound) return; // prevent double-binding
+    if (!self || !self.els) return; // Ensure main inspector is available
+    
+    if (this._bound) {
+      // Clean up existing handlers before rebinding
+      this.cleanup();
+    }
     // Render log panel structure inside container
     const host = document.getElementById('srv-log-panel');
     if (host && !host._rendered) {
@@ -106,9 +151,9 @@ export class ServerInspectorLogs {
       if (self.els.logsBody) self.els.logsBody.innerHTML = '';
       this.ensureBackgroundSubscription();
     } catch(_) {} };
-    self.els.logsBtn && self.els.logsBtn.addEventListener('click', open);
-    self.els.logsClose && self.els.logsClose.addEventListener('click', close);
-    self.els.logsRefresh && self.els.logsRefresh.addEventListener('click', () => this.fetchOnce());
+    if (self.els.logsBtn) this._addEventListener(self.els.logsBtn, 'click', open);
+    if (self.els.logsClose) this._addEventListener(self.els.logsClose, 'click', close);
+    if (self.els.logsRefresh) this._addEventListener(self.els.logsRefresh, 'click', () => this.fetchOnce());
     try { if (self.els.logsLevel) { self.els.logsLevel.value = 'ALL'; } } catch(_) {}
     // фильтрация по уровню локально + при Live обновляем подписку
     const levelOrder = { DEBUG:1, INFO:2, WARNING:3, ERROR:4, CRITICAL:5 };
@@ -130,16 +175,16 @@ export class ServerInspectorLogs {
       const live = !!(self.els?.logsLive?.checked);
       if (live) this.startLive();
     }, 250); }; })();
-    self.els.logsLevel && self.els.logsLevel.addEventListener('change', deb);
-    self.els.logsGrep && self.els.logsGrep.addEventListener('input', deb);
+    if (self.els.logsLevel) this._addEventListener(self.els.logsLevel, 'change', deb);
+    if (self.els.logsGrep) this._addEventListener(self.els.logsGrep, 'input', deb);
     if (self.els.logsLive) {
-      self.els.logsLive.addEventListener('change', () => {
+      this._addEventListener(self.els.logsLive, 'change', () => {
         const live = !!self.els.logsLive.checked;
         if (live) this.startLive(); else this.unsubscribe();
       });
     }
     if (self.els.logsAutoscroll) {
-      self.els.logsAutoscroll.addEventListener('change', () => {
+      this._addEventListener(self.els.logsAutoscroll, 'change', () => {
         if (self.els.logsAutoscroll.checked) {
           const body = self.els?.logsBody; if (body) { body.scrollTop = body.scrollHeight; }
           self._logsNewCounter = 0; this.updateBadge();
@@ -147,7 +192,7 @@ export class ServerInspectorLogs {
       });
     }
     if (self.els.logsDownload) {
-      self.els.logsDownload.addEventListener('click', async () => {
+      this._addEventListener(self.els.logsDownload, 'click', async () => {
         try {
           const level = self.els.logsLevel?.value || 'DEBUG';
           const grep = self.els.logsGrep?.value || '';
@@ -173,7 +218,7 @@ export class ServerInspectorLogs {
     }
     // Очистить: сбросить DOM и счётчики
     if (self.els.logsClear) {
-      self.els.logsClear.addEventListener('click', () => {
+      this._addEventListener(self.els.logsClear, 'click', () => {
         try {
           if (self.els.logsBody) self.els.logsBody.innerHTML = '';
           self._logsNewCounter = 0; this.updateBadge();
@@ -183,7 +228,7 @@ export class ServerInspectorLogs {
     }
     // Toggle "Новые"
     if (self.els.logsToggleNew) {
-      self.els.logsToggleNew.addEventListener('click', () => {
+      this._addEventListener(self.els.logsToggleNew, 'click', () => {
         try {
           const body = self.els?.logsBody; if (!body) return;
           const state = self.els.logsToggleNew.dataset.state || 'all';
@@ -245,14 +290,27 @@ export class ServerInspectorLogs {
           else { self._logsNewCounter = (self._logsNewCounter || 0) + lines.length; this.updateBadge(); }
         } catch(_) {}
       };
-      try { window.socket && window.socket.on('log_record_batch', this._onLogsBatch); } catch(_) {}
+      try { 
+        if (window.socket && !window.socket._logsHandlerBound) {
+          window.socket.on('log_record_batch', this._onLogsBatch); 
+          window.socket._logsHandlerBound = true;
+        }
+      } catch(_) {}
     }
   }
 
   subscribe(level='INFO', grep='') { try { if (window.socket) { window.socket.emit('subscribe_logs', { level, grep }); this.main._logsSubscribed = true; this.main._logsSubLevel = level; this.main._logsSubGrep = grep; } } catch(_) {} }
   unsubscribe() {
     try { if (window.socket) { window.socket.emit('unsubscribe_logs'); } } catch(_) {}
-    try { if (this._onLogsBatch && window.socket) { window.socket.off('log_record_batch', this._onLogsBatch); this._onLogsBatch = null; } } catch(_) {}
+    try { 
+      if (this._onLogsBatch && window.socket) { 
+        window.socket.off('log_record_batch', this._onLogsBatch); 
+        this._onLogsBatch = null; 
+        if (window.socket._logsHandlerBound) {
+          window.socket._logsHandlerBound = false;
+        }
+      } 
+    } catch(_) {}
     this.main._logsSubscribed = false;
   }
 
