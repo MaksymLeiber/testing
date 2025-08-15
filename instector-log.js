@@ -47,6 +47,14 @@ export class ServerInspectorLogs {
         }
       }
       
+      // Reset rendered flag for log panel
+      try {
+        const host = document.getElementById('srv-log-panel');
+        if (host && host._rendered) {
+          host._rendered = false;
+        }
+      } catch(_) {}
+      
       this._bound = false;
     } catch(_) {}
   }
@@ -70,7 +78,11 @@ export class ServerInspectorLogs {
     }
     // Render log panel structure inside container
     const host = document.getElementById('srv-log-panel');
-    if (host && !host._rendered) {
+    if (!host) {
+      return;
+    }
+    
+    if (!host._rendered) {
       host.innerHTML = `
         <div class="srv-log-header">
           <div class="srv-log-title"><i class="bi bi-journal-text" style="margin-right:6px"></i>Логи</div>
@@ -114,8 +126,12 @@ export class ServerInspectorLogs {
       self.els.logsAutoscroll = host.querySelector('#srv-logs-autoscroll');
       self.els.logsToggleNew = host.querySelector('#srv-logs-toggle-new');
     }
-    const open = async () => { try {
-      self.els.logsPanel?.classList.add('open');
+    const open = async () => { 
+      try {
+        if (!self.els.logsPanel) {
+          return;
+        }
+        self.els.logsPanel.classList.add('open');
       // Синхронизируем уровень бэйджа из главного инспектора перед открытием
       try {
         if (self && typeof self._loadSetting === 'function') {
@@ -151,7 +167,9 @@ export class ServerInspectorLogs {
       if (self.els.logsBody) self.els.logsBody.innerHTML = '';
       this.ensureBackgroundSubscription();
     } catch(_) {} };
-    if (self.els.logsBtn) this._addEventListener(self.els.logsBtn, 'click', open);
+    if (self.els.logsBtn) {
+      this._addEventListener(self.els.logsBtn, 'click', open);
+    }
     if (self.els.logsClose) this._addEventListener(self.els.logsClose, 'click', close);
     if (self.els.logsRefresh) this._addEventListener(self.els.logsRefresh, 'click', () => this.fetchOnce());
     try { if (self.els.logsLevel) { self.els.logsLevel.value = 'ALL'; } } catch(_) {}
