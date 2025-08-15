@@ -1101,7 +1101,11 @@ input[type=number] {
   }
 
   _buildPanel() {
-    if (document.getElementById('server-inspector-panel')) return;
+    // Check if panel exists and remove it if it does
+    const existingPanel = document.getElementById('server-inspector-panel');
+    if (existingPanel) {
+      existingPanel.remove();
+    }
     const panel = document.createElement('div');
     panel.id = 'server-inspector-panel';
     panel.innerHTML = `
