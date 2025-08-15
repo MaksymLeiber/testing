@@ -1,5 +1,6 @@
 import { showWarning, showError, showInfo } from '../toast.js';
 import { initTooltips, attachHelpTooltip } from '../tooltips.js';
+import { ServerInspectorLogs } from './instector-log.js';
 
 class ServerInspector {
   constructor() {
@@ -14,7 +15,12 @@ class ServerInspector {
     this._skeletonTimer = null;
     this._skeletonUntil = 0;
     this._lastData = null;
+    this._lastLsSaveTs = 0; // ограничение записи lastServerDataTime
+    this._lastClientMetricsTs = 0; // throttle для клиентских метрик
+    this._clientMetricsMinIntervalMs = 1000; // мин. интервал обновления клиентских метрик
     this._lastJsMem = null; // Последнее значение памяти
+    this._serverBootId = null;
+    this._restartInProgress = false;
     this._currentArrow = ''; // Текущая стрелка
     
     // Garbage Collection tracking
@@ -25,6 +31,20 @@ class ServerInspector {
     this._lastMemForGc = null; // Последнее значение памяти для отслеживания GC
     this._gcDetectionTimer = null; // Таймер для отслеживания GC
     this._lastGcFreed = null; // Сколько памяти было освобождено при последней GC
+    
+    // Клиентские метрики
+    this._clientMetricsTimer = null;
+    this._clientDomObserver = null;
+    this._longTasksObserver = null;
+    this._longTasksCount = 0;
+    this._longTasksRecent = [];
+    this._latencyTimerId = null;
+    this._pendingRttAt = null;
+    this._latencyRttMs = null;
+    this._latencyHttpMs = null;
+    this._wsSamples = []; // { ts, bytes }
+    this._wsIntervals = []; // { ts, d } межсообщенческие интервалы (мс) с таймстампом
+    this._wsLastEventTs = null;
 
     // History
     this.serverHistory = [];
@@ -36,8 +56,16 @@ class ServerInspector {
     this.intervalId = null;
     this._realtimeFallbackTimer = null;
     this._httpPollId = null;
+    this._httpPollTimeout = null; // setTimeout-базовый поллинг (с джиттером)
     this._lastServerInfoTs = 0;
     this._settingsNs = 'srv_settings_';
+
+    // UI backpressure и видимость
+    this._uiUpdateScheduled = false;
+    this._lastUiUpdateAt = 0;
+    this._uiUpdateMinIntervalMs = 250;
+    this._visHandler = null;
+    this._healthFetchInflight = false;
 
     // Thresholds (loaded from settings)
     this.cpuWarn = this._loadSetting('cpuWarn', 60);
@@ -50,8 +78,23 @@ class ServerInspector {
     this.tempGpuCrit = this._loadSetting('tempGpuCrit', 90);
     this.toastsEnabled = this._loadSetting('toastsEnabled', true);
     this.notifyInterval = this._loadSetting('notifyInterval', 60000);
-    this._viewSettings = this._loadSetting('viewSettings', {});
+    this._viewSettings = this._loadJsonSetting('viewSettings', {});
+    this.desktopNotify = this._loadSetting('desktopNotify', false);
     this.disableAllNotifications = this._loadSetting('disableAll', false);
+    this.logsBadgeLevel = this._loadSetting('badgeLevel', 'INFO');
+    this.logColors = this._loadJsonSetting('logColors', {
+      ts: '#9aa0a6',
+      ip: '#8ab4f8',
+      debug: '#9aa0a6',
+      info: '#c3e88d',
+      warning: '#ffcb6b',
+      error: '#ff6e6e',
+      critical: '#ff5555'
+    });
+    this.logsHttpLimit = Number(this._loadSetting('logsLimit', 500)) || 500;
+    this._newLogsBuffer = []; // хранит последние подходящие под уровень бэйджа логи
+    this._newLogsMax = Number(this._loadSetting('logsNewBuf', 200)) || 200;   // максимум хранимых "новых" записей
+    this._logsAllSnapshot = null; // снимок DOM при переключении в режим "Новые"
 
     // Anti-spam for notifications
     this._lastNotifyTimes = {}; // key -> timestamp
@@ -65,6 +108,9 @@ class ServerInspector {
 
     window.__serverInspectorInstance = this;
     try { if (!window.serverInspector) window.serverInspector = this; } catch(_) {}
+
+    // Compose log subsystem (Phase 1 adapter delegates to existing methods)
+    this.logs = new ServerInspectorLogs(this);
   }
 
   _formatBytesShort(bytes) {
@@ -115,12 +161,222 @@ class ServerInspector {
     
     // Инициализируем отслеживание GC
     this._initGCTracking();
+    // Long Tasks
+    this._startLongTasksObserver();
+    
+    // Запускаем обновление метрик только если панель видима
+    if (this.isVisible) {
+      this._updateClientMetrics();
+      this._clientMetricsTimer = setInterval(() => this._updateClientMetrics(), 5000);
+    }
+  }
+
+  _startLongTasksObserver() {
+    try {
+      // Сброс
+      this._longTasksCount = 0;
+      this._longTasksRecent = [];
+      if (this._longTasksObserver && typeof this._longTasksObserver.disconnect === 'function') {
+        this._longTasksObserver.disconnect();
+        this._longTasksObserver = null;
+      }
+      if (typeof PerformanceObserver === 'undefined') {
+        // нет поддержки
+        return;
+      }
+      const supported = PerformanceObserver.supportedEntryTypes || [];
+      if (!supported.includes('longtask')) {
+        return;
+      }
+      this._longTasksObserver = new PerformanceObserver((list) => {
+        try {
+          const entries = list.getEntries();
+          this._longTasksCount += entries.length;
+          for (const entry of entries) {
+            
+            // Сохраняем не только длительность, но и атрибуцию
+            this._longTasksRecent.push({
+              duration: entry.duration,
+              attribution: this._formatLongTaskAttribution(entry)
+            });
+          }
+          // Ограничиваем историю последних задач
+          while(this._longTasksRecent.length > 5) {
+            this._longTasksRecent.shift();
+          }
+          this._renderLongTasks();
+        } catch(_) {}
+      });
+      this._longTasksObserver.observe({entryTypes: ['longtask']});
+      this._renderLongTasks();
+    } catch(_) {}
+  }
+
+  _stopLongTasksObserver() {
+    try { if (this._longTasksObserver) { this._longTasksObserver.disconnect(); this._longTasksObserver = null; } } catch(_) {}
+  }
+
+  _renderLongTasks() {
+    try {
+      if (!this.els) return;
+      if (this.els.clLongTasksCount) {
+        const supported = (typeof PerformanceObserver !== 'undefined') && (PerformanceObserver.supportedEntryTypes || []).includes('longtask');
+        this.els.clLongTasksCount.textContent = supported ? String(this._longTasksCount) : 'Недоступно';
+      }
+      if (this.els.clLongTasksRecent) {
+        if (!this._longTasksRecent || this._longTasksRecent.length === 0) {
+          this.els.clLongTasksRecent.textContent = '-';
+        } else {
+          const text = this._longTasksRecent.map((r) => {
+            const duration = `${Math.round(r.duration)}мс`;
+            return r.attribution ? `${duration} (${r.attribution})` : duration;
+          }).join(', ');
+          this.els.clLongTasksRecent.textContent = text;
+        }
+      }
+    } catch(_) {}
+  }
+  
+  /**
+   * Форматирует информацию об источнике Long Task.
+   * @param {PerformanceLongTaskTiming} entry 
+   * @returns {string|null}
+   */
+  _formatLongTaskAttribution(entry) {
+    if (!entry.attribution || entry.attribution.length === 0) {
+      return null;
+    }
+    const a = entry.attribution[0];
+    // Если имя задачи 'unknown' или отсутствует, не показываем атрибуцию.
+    if (!a.name || a.name === 'unknown') {
+      return null;
+    }
+    let res = a.name; // 'script', 'layout', etc.
+    if (a.containerType) {
+      const type = a.containerType === 'window' ? 'окно' : a.containerType;
+      const src = a.containerSrc ? ` "${a.containerSrc.substring(0, 30)}..."` : (a.containerId ? ` #${a.containerId}` : '');
+      res += ` в ${type}${src}`;
+    }
+    return res;
+  }
+  
+  // Метод для принудительной очистки памяти
+  _forceMemoryCleanup() {
+    try {
+      // Сбрасываем счетчики GC
+      this._gcCount = 0;
+      this._minorGcCount = 0;
+      this._majorGcCount = 0;
+      this._lastGcTime = null;
+      this._lastMemForGc = null;
+      this._lastGcFreed = null;
+      
+      // Принудительно запускаем сборку мусора (если поддерживается)
+      if (window.gc) {
+        window.gc();
+      }
+      
+      console.log('Принудительная очистка памяти выполнена');
+    } catch(_) {}
+  }
+  
+  // Метод для мониторинга использования памяти
+  _checkMemoryHealth() {
+    try {
+      if (!performance || !performance.memory) return;
+      
+      const mem = performance.memory;
+      const usedMB = mem.usedJSHeapSize / 1024 / 1024;
+      const totalMB = mem.totalJSHeapSize / 1024 / 1024;
+      const limitMB = mem.jsHeapSizeLimit / 1024 / 1024;
+      
+      // Предупреждение если используется больше 80% доступной памяти
+      if (usedMB / limitMB > 0.8) {
+        console.warn(`Высокое использование памяти: ${usedMB.toFixed(1)}МБ из ${limitMB.toFixed(1)}МБ`);
+        
+        // Если Major GC больше Minor GC - это признак утечки
+        if (this._majorGcCount > this._minorGcCount) {
+          console.warn('Обнаружена потенциальная утечка памяти: Major GC > Minor GC');
+          if (!this.disableAllNotifications) {
+            showWarning('Обнаружена потенциальная утечка памяти');
+          }
+        }
+      }
+    } catch(_) {}
+  }
+  
+  // Метод для оптимизации DOM-операций
+  _optimizeDOMOperations() {
+    try {
+      // Используем DocumentFragment для массовых операций
+      if (this.els && this.els.componentsBar) {
+        const fragment = document.createDocumentFragment();
+        // Здесь можно добавить оптимизированные DOM-операции
+      }
+      
+      // Ограничиваем количество DOM-элементов
+      const totalElements = document.getElementsByTagName('*').length;
+      if (totalElements > 10000) {
+        console.warn(`Большое количество DOM-элементов: ${totalElements}`);
+      }
+    } catch(_) {}
+  }
+  
+  // Метод для очистки неиспользуемых объектов
+  _cleanupUnusedObjects() {
+    try {
+      // Очищаем неиспользуемые ссылки
+      if (this._lastData && !this.isVisible) {
+        this._lastData = null;
+      }
+      
+      // Очищаем историю если она слишком большая
+      if (this.serverHistory.length > this.maxHistoryLength) {
+        this.serverHistory = this.serverHistory.slice(-this.maxHistoryLength);
+      }
+      
+      // Очищаем старые уведомления
+      const now = Date.now();
+      Object.keys(this._lastNotifyTimes).forEach(key => {
+        if (now - this._lastNotifyTimes[key] > 300000) { // 5 минут
+          delete this._lastNotifyTimes[key];
+        }
+      });
+    } catch(_) {}
+  }
+  
+  // Метод для мониторинга производительности
+  _monitorPerformance() {
+    try {
+      // Проверяем частоту кадров
+      if (performance && performance.now) {
+        const now = performance.now();
+        if (!this._lastFrameTime) {
+          this._lastFrameTime = now;
+        } else {
+          const frameTime = now - this._lastFrameTime;
+          if (frameTime > 16.67) { // Меньше 60 FPS
+            console.warn(`Низкая частота кадров: ${(1000/frameTime).toFixed(1)} FPS`);
+          }
+          this._lastFrameTime = now;
+        }
+      }
+      
+      // Проверяем время выполнения GC
+      if (this._lastGcTime && performance && performance.now) {
+        const gcTime = performance.now() - this._lastGcTime;
+        if (gcTime > 100) { // GC дольше 100мс
+          console.warn(`Медленная сборка мусора: ${gcTime.toFixed(1)}мс`);
+        }
+      }
+    } catch(_) {}
   }
   
   _initGCTracking() {
     // Инициализируем отслеживание памяти для определения GC
     if (performance && performance.memory) {
       this._lastMemForGc = performance.memory.usedJSHeapSize;
+      console.log('[Inspector]: Система GC инициализирована');
       
       // Проверяем изменения памяти каждые 5 секунд
       this._gcDetectionTimer = setInterval(() => {
@@ -134,7 +390,7 @@ class ServerInspector {
             // Minor GC: падение на 5-15%, Major GC: падение на 15%+
             if (dropPercent >= 0.05) {
               // Защита от дребезга: не считаем GC чаще чем раз в 500мс
-              if (Date.now() - this._lastGcTime > 500) {
+              if (!this._lastGcTime || (Date.now() - this._lastGcTime) > 500) {
                 this._gcCount++;
                 this._lastGcTime = Date.now();
                 this._lastGcFreed = this._lastMemForGc - currentMem; // Запоминаем сколько освободилось
@@ -146,7 +402,6 @@ class ServerInspector {
                 } else {
                   this._minorGcCount++;
                 }
-                console.log(`${gcType} GC: освобождено ${(this._lastGcFreed / 1024 / 1024).toFixed(2)} МБ (${(dropPercent * 100).toFixed(1)}%)`);
               }
             }
           }
@@ -185,9 +440,19 @@ class ServerInspector {
   }
   _updateClientMetrics() {
     try {
+      // Проверяем, что элементы существуют
+      if (!this.els) return;
+      // Throttle обновления клиентских метрик
+      const _now = Date.now();
+      if (this._lastClientMetricsTs && (_now - this._lastClientMetricsTs) < this._clientMetricsMinIntervalMs) return;
+      this._lastClientMetricsTs = _now;
+      
       const totalDom = document.getElementsByTagName('*').length;
       const appDom = this._estimateAppDomCount();
-      const perf = (performance && performance.timing) ? performance.timing : null;
+      const navEntry = (performance && typeof performance.getEntriesByType === 'function')
+        ? (performance.getEntriesByType('navigation') || [])[0]
+        : null;
+      const perf = (performance && performance.timing) ? performance.timing : null; // fallback
       const jsStats = this._sumJsTransferredBytes();
       if (this.els.clDomTotal) this.els.clDomTotal.textContent = String(totalDom);
       if (this.els.clDomApp) this.els.clDomApp.textContent = String(appDom);
@@ -242,17 +507,38 @@ class ServerInspector {
           this._currentArrow = '';
         }
       }
-      if (this.els.clDcl && perf) {
+      if (this.els.clDcl) {
+        if (navEntry && Number.isFinite(navEntry.domContentLoadedEventEnd)) {
+          this.els.clDcl.textContent = this._formatMsBrief(navEntry.domContentLoadedEventEnd - (navEntry.startTime || 0));
+        } else if (perf) {
         const dcl = perf.domContentLoadedEventEnd - perf.navigationStart;
         this.els.clDcl.textContent = this._formatMsBrief(dcl);
+        } else {
+          this.els.clDcl.textContent = 'Недоступно';
+        }
       }
-      if (this.els.clLoad && perf) {
+      if (this.els.clLoad) {
+        if (navEntry && Number.isFinite(navEntry.loadEventEnd)) {
+          // Некоторые браузеры дают navEntry.startTime=0, но на всякий случай нормализуем из navigationStart
+          const base = Number.isFinite(navEntry.startTime) ? navEntry.startTime : 0;
+          this.els.clLoad.textContent = this._formatMsBrief(navEntry.loadEventEnd - base);
+        } else if (perf) {
         const load = perf.loadEventEnd - perf.navigationStart;
         this.els.clLoad.textContent = this._formatMsBrief(load);
+        } else {
+          this.els.clLoad.textContent = 'Недоступно';
+        }
       }
       
       // Обновляем GC метрики
       if (this.els.clGc) {
+        if (!(performance && performance.memory)) {
+          if (Date.now() >= this._skeletonUntil) {
+            this.els.clGc.textContent = 'Недоступно';
+            if (this.els.clGcTypes) this.els.clGcTypes.textContent = 'Недоступно';
+          }
+          return;
+        }
         const now = Date.now();
         let gcText = '';
         let fullText = ''; // Для tooltip
@@ -338,8 +624,17 @@ class ServerInspector {
         }
       }
     } catch(_) {}
-    try { clearInterval(this._clientMetricsTimer); } catch(_) {}
-    this._clientMetricsTimer = setInterval(() => this._updateClientMetrics(), 5000);
+    
+    // Проверяем здоровье памяти
+    this._checkMemoryHealth();
+    
+    // Оптимизируем DOM-операции
+    this._optimizeDOMOperations();
+    
+    // Очищаем неиспользуемые объекты
+    this._cleanupUnusedObjects();
+    
+    // Таймер теперь запускается в _startClientMetricsRealtime
   }
 
   _renderComponents(comps) {
@@ -352,7 +647,12 @@ class ServerInspector {
       if (k === 'redirect') return `bi-arrow-left-right ${base}`;
       if (k === 'http2') return `bi-lightning-charge-fill ${base}`;
       if (k === 'ws') return `bi-wifi ${base}`;
-      if (k === 'workers') return `bi-diagram-3 ${base}`;
+      if (k === 'workers') {
+        // Зеленая, если активных > 0, иначе красная
+        const st2 = (comps['workers'] && comps['workers'].active > 0) ? 'ok' : 'crit';
+        const cls = st2 === 'ok' ? 'status-ok' : 'status-crit';
+        return `bi-diagram-3 ${cls}`;
+      }
       if (k === 'database') return `bi-database ${base}`;
       return `bi-cpu ${base}`;
     };
@@ -399,7 +699,8 @@ class ServerInspector {
   _loadInterval() {
     try {
       const v = parseInt(localStorage.getItem('srv_inspector_interval'), 10);
-      return Number.isFinite(v) ? Math.max(5000, Math.min(60000, v)) : 30000;
+      // Разрешаем 2с как минимальный интервал по просьбе пользователя
+      return Number.isFinite(v) ? Math.max(2000, Math.min(60000, v)) : 30000;
     } catch(_) { return 30000; }
   }
   _saveInterval(v) {
@@ -416,12 +717,30 @@ class ServerInspector {
       const v = localStorage.getItem(this._settingsNs + key);
       if (v == null) return defVal;
       if (v === 'true' || v === 'false') return v === 'true';
+      // если это число в строке — вернуть число, иначе вернуть исходную строку
+      const isNumeric = /^\s*[-+]?\d+(?:\.\d+)?\s*$/.test(v);
+      if (isNumeric) {
       const num = Number(v);
       return Number.isFinite(num) ? num : defVal;
+      }
+      return v;
     } catch(_) { return defVal; }
   }
   _saveSetting(key, val) {
     try { localStorage.setItem(this._settingsNs + key, String(val)); } catch(_) {}
+  }
+
+  // JSON-настройки для сложных значений (например, viewSettings)
+  _loadJsonSetting(key, defVal) {
+    try {
+      const raw = localStorage.getItem(this._settingsNs + key);
+      if (!raw) return defVal;
+      const parsed = JSON.parse(raw);
+      return (parsed && typeof parsed === 'object') ? parsed : defVal;
+    } catch(_) { return defVal; }
+  }
+  _saveJsonSetting(key, obj) {
+    try { localStorage.setItem(this._settingsNs + key, JSON.stringify(obj)); } catch(_) {}
   }
 
   init() {
@@ -467,6 +786,12 @@ class ServerInspector {
       .srv-btn { background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.3); color:#fff; padding: 2px 6px; border-radius: 4px; font-size: 9px; cursor: pointer; display:inline-flex; align-items:center; gap:6px; }
       .srv-icon-btn { background: transparent; border: none; color:#ccc; cursor:pointer; font-size: 14px; padding: 4px; margin-right: 6px; }
       .srv-icon-btn:hover { color:#fff; }
+      .srv-icon-btn.notify-off { color: #f44336; }
+      .srv-icon-btn.notify-off:hover { color: #ff7961; }
+      #srv-restart-btn { color: #f44336; }
+      #srv-restart-btn:hover { color: #ff7961; }
+      #srv-restart-btn { color: #f44336; }
+      #srv-restart-btn:hover { color: #ff7961; }
       #server-inspector-content { flex: 1; overflow:auto; padding: 10px 12px; }
       #server-inspector-content { scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.28) transparent; }
       #server-inspector-content::-webkit-scrollbar { width: 8px; }
@@ -477,6 +802,25 @@ class ServerInspector {
       #server-inspector-content .server-metric-label { color:#ccc; display:flex; align-items:center; gap:6px; }
       #server-inspector-content .server-metric-label i { opacity: 0.9; }
       #server-inspector-content .server-metric-value { font-weight:bold; }
+      .srv-log-panel { position:absolute; top:0; left:0; width: 425px; height: 100%; background: rgb(15,15,15); border-right:1px solid rgba(255,255,255,0.12); box-shadow: 6px 0 12px rgba(0,0,0,0.4); transform: translateX(-100%); opacity:0; pointer-events:none; transition: transform .25s ease, opacity .25s ease; z-index: 12; border-radius: 0 8px 8px 0; display:flex; flex-direction:column; }
+      .srv-log-panel.open { transform: translateX(0); opacity:1; pointer-events:auto; }
+      .srv-log-header { display:flex; align-items:center; justify-content: space-between; padding: 10px 12px; gap:8px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+      .srv-log-title { font-weight:bold; color:#fff; }
+      .srv-log-head-controls { display:flex; align-items:center; gap:6px; flex: 1; }
+      .srv-log-toolbar { display:flex; align-items:center; gap:6px; padding: 8px 12px; border-bottom:1px solid rgba(255,255,255,0.08); }
+      .srv-log-body { flex:1; overflow:auto; font-family: monospace; font-size: 11px; padding: 8px 12px; }
+      .srv-log-line { white-space: pre-wrap; word-break: break-word; padding: 1px 0; }
+      .srv-log-line.level-ERROR { color: #f44336; }
+      .srv-log-line.level-WARNING { color: #ffb74d; }
+      .srv-log-line.level-INFO { color: #cfd8dc; }
+      .srv-log-line.level-DEBUG { color: #90caf9; }
+      .srv-log-header .srv-input { height: 22px; font-size: 10px; padding: 1px 6px; }
+      .srv-log-header .srv-setting-item { font-size: 10px; }
+      .srv-log-header .srv-input, .srv-log-toolbar .srv-input { background: rgba(255,255,255,0.08); color: #fff; border: 1px solid rgba(255,255,255,0.18); }
+      .srv-log-header .srv-input:focus, .srv-log-toolbar .srv-input:focus { outline: none; background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.28); }
+      #server-inspector-panel select option { background: rgb(15, 15, 15); color: #fff; }
+      .srv-log-header .srv-input, .srv-log-toolbar .srv-input { background: rgba(255,255,255,0.08); color: #fff; border: 1px solid rgba(255,255,255,0.18); }
+      .srv-log-header .srv-input:focus, .srv-log-toolbar .srv-input:focus { outline: none; background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.28); }
       .server-help { color:#8ab4f8; cursor: help !important; opacity: 0.85; }
       .server-help:hover { opacity: 1; cursor: help !important; }
       .metric-with-icon { display:flex; align-items:center; gap:6px; justify-content:flex-end; }
@@ -543,7 +887,7 @@ class ServerInspector {
       #srv-interval option { background: rgb(15, 15, 15); color: #fff; }
       #srv-interval:disabled { cursor: not-allowed; opacity: 0.5; }
       .srv-interval-label.disabled { opacity: 0.5; }
-      #srv-workers-active-names { font-size: 90%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #srv-workers-active-names { font-size: 80%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .hidden-by-settings { display: none !important; }
 
 
@@ -608,6 +952,150 @@ class ServerInspector {
         background: linear-gradient(90deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.18) 40%, rgba(255,255,255,0.32) 50%, rgba(255,255,255,0.18) 60%, rgba(255,255,255,0.05) 100%);
         animation: srv-shimmer 1.1s infinite;
       }
+      /* highlight for newly arrived logs */
+      .srv-log-line.new { background: rgba(255,82,82,0.14); }
+      #srv-logs-toggle-new[data-badge]::after {
+        content: attr(data-badge);
+        position:absolute; transform: translate(8px,-6px);
+        background:#ff5252; color:#fff; border-radius:10px; padding:0 4px; font-size:10px; line-height:14px;
+      }
+
+      /* Rounded, modern checkboxes inside inspector */
+      #server-inspector-panel input[type="checkbox"] {
+        appearance: none;
+        -webkit-appearance: none;
+        width: 16px; height: 16px;
+        border-radius: 6px;
+        border: 2px solid rgba(255,255,255,0.35);
+        background: transparent;
+        display: inline-block; position: relative; cursor: pointer;
+        outline: none; transition: all .15s ease;
+      }
+      #server-inspector-panel input[type="checkbox"]:hover { border-color: rgba(255,255,255,0.6); }
+      #server-inspector-panel input[type="checkbox"]:checked {
+        background: linear-gradient(180deg, #4cc0ff, #2b9de4);
+        border-color: transparent;
+        box-shadow: 0 0 0 2px rgba(76,192,255,0.22);
+      }
+      #server-inspector-panel input[type="checkbox"]:checked::after {
+        content:''; position:absolute; left:4px; top:4px; width:6px; height:6px; border-radius: 3px; background:#0b1a24;
+      }
+
+      /* Log coloring via CSS variables */
+      #srv-log-panel { 
+        --log-ts: ${this.logColors?.ts || '#9aa0a6'}; 
+        --log-ip: ${this.logColors?.ip || '#8ab4f8'}; 
+        --log-debug: ${this.logColors?.debug || '#9aa0a6'}; 
+        --log-info: ${this.logColors?.info || '#c3e88d'}; 
+        --log-warning: ${this.logColors?.warning || '#ffcb6b'}; 
+        --log-error: ${this.logColors?.error || '#ff6e6e'}; 
+        --log-critical: ${this.logColors?.critical || '#ff5555'}; 
+        --log-http-method: #82aaff;
+        --log-http-path: #a1a1a1;
+        --log-http-2xx: #00e676;
+        --log-http-3xx: #42a5f5;
+        --log-http-4xx: #ffd54f;
+        --log-http-5xx: #ef5350;
+        --log-uuid: #f78c6c;
+        --log-errre: #ff8a80;
+      }
+      #srv-log-panel .log-ts { color: var(--log-ts); margin-right: 8px; opacity: .9; }
+      #srv-log-panel .log-logger { color: #a1a1a1; margin: 0 6px; }
+      #srv-log-panel .log-ip { color: var(--log-ip); font-weight: 600; }
+      #srv-log-panel .srv-log-line { padding: 2px 6px; white-space: nowrap; }
+      #srv-log-panel .srv-log-body { white-space: nowrap; }
+      #srv-log-panel .srv-log-line .log-level { font-weight: 700; margin-right: 8px; }
+      #srv-log-panel .srv-log-line.level-DEBUG .log-level { color: var(--log-debug); }
+      #srv-log-panel .srv-log-line.level-INFO .log-level { color: var(--log-info); }
+      #srv-log-panel .srv-log-line.level-WARNING .log-level { color: var(--log-warning); }
+      #srv-log-panel .srv-log-line.level-ERROR .log-level { color: var(--log-error); }
+      #srv-log-panel .srv-log-line.level-CRITICAL .log-level { color: var(--log-critical); }
+      #srv-log-panel .log-http-method { color: var(--log-http-method); font-weight: 700; margin-right:6px; }
+      #srv-log-panel .log-http-method.method-GET { color:#82aaff; }
+      #srv-log-panel .log-http-method.method-POST { color:#ff79c6; }
+      #srv-log-panel .log-http-method.method-PUT { color:#64ffda; }
+      #srv-log-panel .log-http-method.method-DELETE { color:#ff9860; }
+      #srv-log-panel .log-http-method.method-PATCH { color:#b388ff; }
+      #srv-log-panel .log-http-method.method-OPTIONS { color:#9aa0a6; }
+      #srv-log-panel .log-http-method.method-HEAD { color:#9aa0a6; }
+      #srv-log-panel .log-http-path { color: var(--log-http-path); margin-right:6px; }
+      #srv-log-panel .log-http-status { font-weight: 700; }
+      #srv-log-panel .log-http-status.s2xx { color: var(--log-http-2xx); }
+      #srv-log-panel .log-http-status.s3xx { color: var(--log-http-3xx); }
+      #srv-log-panel .log-http-status.s4xx { color: var(--log-http-4xx); }
+      #srv-log-panel .log-http-status.s5xx { color: var(--log-http-5xx); }
+      #srv-log-panel .log-uuid { color: var(--log-uuid); font-weight: 600; }
+      #srv-log-panel .log-errre { color: var(--log-errre); background: rgba(255,138,128,0.1); padding:0 2px; border-radius:3px; }
+
+      /* removed legacy compact-align for logs color grid to avoid conflicts */
+
+      /* Settings drawer refined */
+      #server-settings-drawer .srv-grid { display: grid; grid-template-columns: 1fr 160px; gap: 4px 10px; align-items: center; }
+      #server-settings-drawer .srv-input { width: 100%; height: 24px; font-size: 12px; }
+      #server-settings-drawer .srv-input[type="number"] { text-align: right; max-width: 100px; }
+      #server-settings-drawer .srv-grid .srv-input,
+      #server-settings-drawer .srv-grid .srv-input-with-unit,
+      #server-settings-drawer .srv-grid select.srv-input { justify-self: end; }
+      #server-settings-drawer .srv-input-with-unit { display: flex; align-items: center; gap: 6px; }
+      #server-settings-drawer .srv-input-with-unit span { color: #9aa0a6; font-size: 11px; }
+      #server-settings-drawer .with-help { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; }
+      #server-settings-drawer .logs-colors-grid { display: grid; grid-template-columns: 1fr min-content; gap: 6px 0; align-items: center; justify-self: stretch; width: 100%; }
+      #server-settings-drawer .logs-colors-grid .srv-input[type="color"] { width: 24px; height: 24px; padding: 0; border-radius: 4px; }
+      #server-settings-drawer .srv-controls-row { display:flex; gap:10px; align-items:center; flex-wrap: wrap; }
+      #server-settings-drawer .srv-log-adv { display: grid; gap:8px; }
+      #server-settings-drawer .srv-log-adv .srv-reg-row { display:flex; align-items:center; gap:8px; width: 100%; }
+      #server-settings-drawer .srv-log-adv .srv-reg-row .srv-input { flex: 1 1 auto; width: 100%; max-width: none; min-width: 0; }
+      #server-settings-drawer .srv-setting-group-body { padding-right: 0; }
+
+      /* Custom checkboxes (grey box with green check) — глобально в инспекторе */
+      #server-inspector-panel input[type="checkbox"] {
+        appearance: none; -webkit-appearance: none; -moz-appearance: none;
+        width: 16px; height: 16px; border-radius: 4px; cursor: pointer;
+        background: #2b2b2b; border: 2px solid #6e6e6e; position: relative;
+        display: inline-block; vertical-align: middle;
+      }
+      #server-inspector-panel input[type="checkbox"]:hover { border-color: #8a8a8a; }
+      #server-inspector-panel input[type="checkbox"]:focus { outline: none; box-shadow: 0 0 0 2px rgba(76,175,80,0.25); }
+      #server-inspector-panel input[type="checkbox"]:checked {
+        background: #2e7d32; border-color: #2e7d32;
+      }
+      #server-inspector-panel input[type="checkbox"]:checked::after {
+        content: '';
+        position: absolute; left: 4px; top: 1px; width: 4px; height: 8px;
+        border-right: 2px solid #fff; border-bottom: 2px solid #fff; transform: rotate(45deg);
+      }
+
+      /* Внешний вид — собственная сетка: название слева, чекбокс справа */
+      #server-settings-drawer .srv-setting-group[data-key="appearance"] .srv-appearance-grid { 
+        display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center; width: 100%;
+      }
+      #server-settings-drawer .srv-setting-group[data-key="appearance"] .srv-appearance-grid .ap-label {
+        display: inline-flex; align-items: center; gap: 6px;
+      }
+      #server-settings-drawer .srv-setting-group[data-key="appearance"] .srv-appearance-grid .ap-ctrl {
+        justify-self: end;
+      }
+
+      /* Уведомления — отдельная сетка для трёх чекбоксов */
+      #server-settings-drawer .srv-setting-group[data-key="notifications"] .srv-notify-grid {
+        display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; align-items: center; width: 100%;
+      }
+      #server-settings-drawer .srv-setting-group[data-key="notifications"] .srv-notify-grid .nt-label {
+        display: inline-flex; align-items: center; gap: 6px;
+      }
+      #server-settings-drawer .srv-setting-group[data-key="notifications"] .srv-notify-grid .nt-ctrl { justify-self: end; }
+
+      /* Убираем стрелки в Chrome, Safari, Edge */
+input::-webkit-outer-spin-button,
+input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Убираем стрелки в Firefox */
+input[type=number] {
+  -moz-appearance: textfield;
+}
     `;
     document.head.appendChild(style);
   }
@@ -620,10 +1108,15 @@ class ServerInspector {
       <div id="server-inspector-header">
         <div id="server-inspector-title">Сервер</div>
         <div class="srv-header-actions">
+          <button class="srv-icon-btn" id="srv-memory-cleanup" title="Очистить память"><i class="bi bi-recycle"></i></button>
+          <button class="srv-icon-btn" id="srv-restart-btn" title="Перезапуск сервера"><i class="bi bi-arrow-repeat"></i></button>
+          <button class="srv-icon-btn" id="srv-logs-btn" title="Логи сервера"><i class="bi bi-journal-text"></i></button>
+          <button class="srv-icon-btn" id="srv-notify-toggle" title="Уведомления включены"><i class="bi bi-bell-fill"></i></button>
           <button class="srv-icon-btn" id="srv-settings-btn" title="Настройки"><i class="bi bi-gear"></i></button>
           <button class="srv-btn" id="srv-close-btn">Закрыть</button>
         </div>
       </div>
+      <div id="srv-log-panel" class="srv-log-panel"></div>
 
           <!-- Components compact status bar -->
       <div id="srv-components-bar"></div>
@@ -721,6 +1214,8 @@ class ServerInspector {
             <div class="server-metric"><span class="server-metric-label"><i class="bi bi-diagram-3"></i> Типы GC <i class="bi bi-question-circle-fill server-help" data-help="Minor GC - небольшая очистка памяти (падение на 5-15%): удаление временных объектов, очистка стека. Major GC - глубокая очистка памяти (падение на 15%+): удаление неиспользуемых объектов, дефрагментация памяти. Частые Major GC могут указывать на неэффективное использование памяти."></i></span><span class="server-metric-value" id="cl-gc-types">-</span></div>
             <div class="server-metric"><span class="server-metric-label"><i class="bi bi-clock-history"></i> DOMContentLoaded <i class="bi bi-question-circle-fill server-help" data-help="Время DOMContentLoaded по PerformanceTiming."></i></span><span class="server-metric-value" id="cl-dcl">-</span></div>
             <div class="server-metric"><span class="server-metric-label"><i class="bi bi-stopwatch"></i> Load Event <i class="bi bi-question-circle-fill server-help" data-help="Время полной загрузки страницы по PerformanceTiming."></i></span><span class="server-metric-value" id="cl-load">-</span></div>
+            <div class="server-metric"><span class="server-metric-label"><i class="bi bi-speedometer2"></i> Long Tasks <i class="bi bi-question-circle-fill server-help" data-help="Количество 'долгих задач' на главном потоке (Long Tasks) с момента открытия инспектора. Долгая задача — блокировка UI >50мс."></i></span><span class="server-metric-value" id="cl-longtasks-count">-</span></div>
+            <div class="server-metric"><span class="server-metric-label"><i class="bi bi-list-ul"></i> Последние Long Tasks <i class="bi bi-question-circle-fill server-help" data-help="Длительности последних 5 длинных задач (мс). Высокие значения — признак 'фризов' интерфейса."></i></span><span class="server-metric-value" id="cl-longtasks-recent">-</span></div>
           </div>
         </div>
 
@@ -736,29 +1231,115 @@ class ServerInspector {
               <span class="left">
                 <i class="bi bi-bell-fill"></i>
                 <span>Уведомления</span>
-                <i class="bi bi-question-circle-fill server-help" data-help="Настройте пороги и частоту всплывающих уведомлений о состоянии сервера."></i>
+                <i class="bi bi-question-circle-fill server-help" data-help="Минималистичные уведомления о состоянии: настройте пороги, интервал и режимы."></i>
               </span>
               <i class="bi bi-caret-down-fill caret"></i>
             </div>
             <div class="srv-setting-group-body">
-          <label class="srv-setting-item"><input type="checkbox" id="srv-toasts-enabled"> Показывать тосты <i class="bi bi-question-circle-fill server-help" data-help="Включает всплывающие сообщения (toast) от инспектора: предупреждения и ошибки о нагрузке CPU/памяти и температурах. Отключение скрывает любые всплывающие уведомления."></i></label>
-          <label class="srv-setting-item"><input type="checkbox" id="srv-only-critical"> Только критичные <i class="bi bi-question-circle-fill server-help" data-help="Показывать только критичные уведомления (красные). Предупреждения (оранжевые) скрываются. Полезно для тихого режима, когда нужны только важные сигналы."></i></label>
-          <div class="srv-grid">
-                <div>Отключить все сообщения</div>
-                <label class="srv-setting-item"><input type="checkbox" id="srv-disable-all"> Выключить уведомления <i class="bi bi-question-circle-fill server-help" data-help="Полностью блокирует уведомления инспектора. Никакие тосты (включая критичные) не будут показываться. Все остальные настройки уведомлений временно отключаются."></i></label>
-                <div>Интервал уведомлений</div>
-                <div class="srv-input-with-unit">
-                  <input class="srv-input" type="number" id="srv-notify-interval" min="0" max="360">
-                  <span>сек</span>
+          <div class="srv-notify-grid">
+            <div class="nt-label">Показывать тосты <i class="bi bi-question-circle-fill server-help" data-help="Включает всплывающие сообщения о важных событиях."></i></div>
+            <div class="nt-ctrl"><input type="checkbox" id="srv-toasts-enabled"></div>
+
+            <div class="nt-label">Только критичные <i class="bi bi-question-circle-fill server-help" data-help="Показывать только критичные уведомления (без предупреждений)."></i></div>
+            <div class="nt-ctrl"><input type="checkbox" id="srv-only-critical"></div>
+
+            <div class="nt-label">Системные уведомления <i class="bi bi-question-circle-fill server-help" data-help="Разрешить нативные уведомления браузера. Включается только если тосты включены. Нужно разрешить в браузере."></i></div>
+            <div class="nt-ctrl"><input type="checkbox" id="srv-desktop-notify"></div>
                 </div>
-            <div>CPU предупреждение %</div><input class="srv-input" type="number" id="srv-cpu-warn" min="1" max="100">
-            <div>CPU критично %</div><input class="srv-input" type="number" id="srv-cpu-crit" min="1" max="100">
-            <div>Память предупреждение %</div><input class="srv-input" type="number" id="srv-mem-warn" min="1" max="100">
-            <div>Память критично %</div><input class="srv-input" type="number" id="srv-mem-crit" min="1" max="100">
-            <div>CPU t° предупреждение</div><input class="srv-input" type="number" id="srv-tcpu-warn" min="25" max="120">
-            <div>CPU t° критично</div><input class="srv-input" type="number" id="srv-tcpu-crit" min="25" max="120">
-            <div>GPU t° предупреждение</div><input class="srv-input" type="number" id="srv-tgpu-warn" min="25" max="120">
-            <div>GPU t° критично</div><input class="srv-input" type="number" id="srv-tgpu-crit" min="25" max="120">
+
+          <div class="srv-grid" style="margin-top:8px;">
+            <div class="with-help">Интервал уведомлений <i class="bi bi-question-circle-fill server-help" data-help="Минимальный интервал между уведомлениями. Сделано для зашиты от спама. Минимальное значение 5 секунд, максимум 360 секунд."></i></div>
+            <div class="srv-input-with-unit"><input class="srv-input" type="number" id="srv-notify-interval" min="0" max="360"><span>сек</span></div>
+
+            <div class="with-help">CPU предупреждение % <i class="bi bi-question-circle-fill server-help" data-help="Порог предупреждения загрузки CPU."></i></div>
+            <input class="srv-input" type="number" id="srv-cpu-warn" min="1" max="100">
+
+            <div class="with-help">CPU критично % <i class="bi bi-question-circle-fill server-help" data-help="Критический порог CPU."></i></div>
+            <input class="srv-input" type="number" id="srv-cpu-crit" min="1" max="100">
+
+            <div class="with-help">Память предупреждение % <i class="bi bi-question-circle-fill server-help" data-help="Порог предупреждения использования памяти."></i></div>
+            <input class="srv-input" type="number" id="srv-mem-warn" min="1" max="100">
+
+            <div class="with-help">Память критично % <i class="bi bi-question-circle-fill server-help" data-help="Критический порог памяти."></i></div>
+            <input class="srv-input" type="number" id="srv-mem-crit" min="1" max="100">
+
+            <div class="with-help">CPU t° предупреждение <i class="bi bi-question-circle-fill server-help" data-help="Порог предупреждения температуры CPU."></i></div>
+            <input class="srv-input" type="number" id="srv-tcpu-warn" min="25" max="120">
+
+            <div class="with-help">CPU t° критично <i class="bi bi-question-circle-fill server-help" data-help="Критическая температура CPU."></i></div>
+            <input class="srv-input" type="number" id="srv-tcpu-crit" min="25" max="120">
+
+            <div class="with-help">GPU t° предупреждение <i class="bi bi-question-circle-fill server-help" data-help="Порог предупреждения температуры GPU."></i></div>
+            <input class="srv-input" type="number" id="srv-tgpu-warn" min="25" max="120">
+
+            <div class="with-help">GPU t° критично <i class="bi bi-question-circle-fill server-help" data-help="Критическая температура GPU."></i></div>
+            <input class="srv-input" type="number" id="srv-tgpu-crit" min="25" max="120">
+          </div>
+            </div>
+          </div>
+
+          <div class="srv-setting-group" data-key="logs">
+            <div class="srv-setting-group-title">
+              <span class="left">
+                <i class="bi bi-journal-text"></i>
+                <span>Логи</span>
+                <i class="bi bi-question-circle-fill server-help" data-help="Настройка бэйджа, загрузки истории и подсветки логов."></i>
+              </span>
+              <i class="bi bi-caret-down-fill caret"></i>
+            </div>
+            <div class="srv-setting-group-body">
+              <div class="srv-grid">
+                <div class="with-help">Уровень бэйджа <i class="bi bi-question-circle-fill server-help" data-help="Уровень для бэйджа на кнопке логов также в логе. По умолчанию DEBUG."></i></div>
+                <select class="srv-input" id="srv-badge-level">
+                  <option value="DEBUG">DEBUG</option>
+                  <option value="INFO">INFO</option>
+                  <option value="WARNING">WARNING</option>
+                  <option value="ERROR">ERROR</option>
+                  <option value="CRITICAL">CRITICAL</option>
+                </select>
+              </div>
+              <!-- Уровень логов при открытии убран: при открытии всегда ALL -->
+              <div class="srv-grid">
+                <div class="with-help">Лимит истории (HTTP) <i class="bi bi-question-circle-fill server-help" data-help="Сколько строк загружать при ручной загрузке по HTTP. По умолчанию 500 строк. Максимум 5000 строк."></i></div>
+                <div class="srv-input-with-unit">
+                <span>строк лога</span>
+                  <input class="srv-input" type="number" id="srv-logs-limit" min="100" max="5000">
+                </div>
+              </div>
+              <div class="srv-grid">
+                <div class="with-help">Размер буфера новых <i class="bi bi-question-circle-fill server-help" data-help="Сколько 'новых' логов хранить для бэйджа."></i></div>
+                <div class="srv-input-with-unit">
+                  <span>строк лога</span>
+                  <input class="srv-input" type="number" id="srv-logs-newbuf" min="50" max="5000">
+                </div>
+              </div>
+              <div class="srv-grid logs-colors-grid" style="gap:1px 10px;">
+                <div class="with-help">Цвет времени <i class="bi bi-question-circle-fill server-help" data-help="Цвет таймстампа в строке лога."></i></div> 
+                <input class="srv-input" type="color" id="srv-logc-ts" style="height:28px; padding:0;">
+                <div class="with-help">Цвет IP <i class="bi bi-question-circle-fill server-help" data-help="Цвет подсветки IP-адресов в тексте лога."></i></div>
+                <input class="srv-input" type="color" id="srv-logc-ip" style="height:28px; padding:0;">
+                <div class="with-help">DEBUG <i class="bi bi-question-circle-fill server-help" data-help="Цвет сообщений DEBUG."></i></div>
+                <input class="srv-input" type="color" id="srv-logc-debug" style="height:28px; padding:0;">
+                <div class="with-help">INFO <i class="bi bi-question-circle-fill server-help" data-help="Цвет сообщений INFO."></i></div>
+                <input class="srv-input" type="color" id="srv-logc-info" style="height:28px; padding:0;">
+                <div class="with-help">WARNING <i class="bi bi-question-circle-fill server-help" data-help="Цвет сообщений WARNING."></i></div>
+                <input class="srv-input" type="color" id="srv-logc-warning" style="height:28px; padding:0;">
+                <div class="with-help">ERROR <i class="bi bi-question-circle-fill server-help" data-help="Цвет сообщений ERROR."></i></div>
+                <input class="srv-input" type="color" id="srv-logc-error" style="height:28px; padding:0;">
+                <div class="with-help">CRITICAL <i class="bi bi-question-circle-fill server-help" data-help="Цвет сообщений CRITICAL."></i></div>
+                <input class="srv-input" type="color" id="srv-logc-critical" style="height:28px; padding:0;">
+                <div class="srv-log-adv" style="grid-column: span 2;">
+                  <div class="srv-reg-row">
+                    <input class="srv-input" type="text" id="srv-logc-err-re" placeholder="RegExp для ошибок (например: Exception|Traceback|Ошибка)" style="height:28px;">
+                    <i class="bi bi-question-circle-fill server-help" data-help="RegExp для подсветки ошибок в сообщении.\nПримеры:\n- Exception|Traceback|Ошибка\n- (Timeout|ConnectionRefused|ECONNRESET)"></i>
+                  </div>
+                  <div class="srv-controls-row">
+                    <label class="srv-setting-item with-help" style="gap:6px; white-space:nowrap;"><input type="checkbox" id="srv-logc-enable-http" checked> HTTP <i class="bi bi-question-circle-fill server-help" data-help="Подсветка HTTP‑метода/пути/кода."></i></label>
+                    <label class="srv-setting-item with-help" style="gap:6px; white-space:nowrap;"><input type="checkbox" id="srv-logc-enable-uuid" checked> UUID <i class="bi bi-question-circle-fill server-help" data-help="Подсветка UUID/hex идентификаторов."></i></label>
+                    <label class="srv-setting-item with-help" style="gap:6px; white-space:nowrap;"><input type="checkbox" id="srv-logc-enable-err" checked> Ошибки <i class="bi bi-question-circle-fill server-help" data-help="Подсветка совпадений по RegExp выше."></i></label>
+                  <button class="srv-btn" id="srv-logc-reset">Сбросить</button>
+                  </div>
+                </div>
           </div>
             </div>
           </div>
@@ -773,15 +1354,30 @@ class ServerInspector {
               <i class="bi bi-caret-down-fill caret"></i>
             </div>
             <div class="srv-setting-group-body">
-              <div class="srv-grid" style="grid-template-columns: 1fr;">
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="metrics"> Секция "Метрики"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="disk"> Секция "Диск I/O"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="queues"> Секция "Очереди / Воркеры"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="db"> Секция "База данных"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="runtime"> Секция "Память / GC / Темп"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="system"> Секция "Инфо о системе"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="ws"> Секция "WebSocket"</label>
-                <label class="srv-setting-item"><input type="checkbox" class="srv-view-toggle" data-key="client"> Секция "Клиент"</label>
+              <div class="srv-appearance-grid">
+                <div class="ap-label">Секция "Метрики" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию 'Метрики'."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="metrics"></div>
+
+                <div class="ap-label">Секция "Диск I/O" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию дискового ввода/вывода."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="disk"></div>
+
+                <div class="ap-label">Секция "Очереди / Воркеры" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию очередей и воркеров."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="queues"></div>
+
+                <div class="ap-label">Секция "База данных" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию метрик базы данных."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="db"></div>
+
+                <div class="ap-label">Секция "Память / GC / Темп" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию памяти/сборок мусора/температур."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="runtime"></div>
+
+                <div class="ap-label">Секция "Инфо о системе" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию статической системной информации."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="system"></div>
+
+                <div class="ap-label">Секция "WebSocket" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию метрик WebSocket."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="ws"></div>
+
+                <div class="ap-label">Секция "Клиент" <i class="bi bi-question-circle-fill server-help" data-help="Показывать секцию метрик клиента (DOM/JS)."></i></div>
+                <div class="ap-ctrl"><input type="checkbox" class="srv-view-toggle" data-key="client"></div>
               </div>
             </div>
           </div>
@@ -796,6 +1392,10 @@ class ServerInspector {
             <div class="server-metric"><span class="server-metric-label"><i class="bi bi-arrow-down-left-square"></i> Получено <i class="bi bi-question-circle-fill server-help" data-help="Сколько сообщений принято сервером."></i></span><span class="server-metric-value" id="srv-ws-recv">-</span></div>
             <div class="server-metric"><span class="server-metric-label"><i class="bi bi-arrows-expand"></i> Средний размер <i class="bi bi-question-circle-fill server-help" data-help="Средний размер сообщений по сети (в байтах)."></i></span><span class="server-metric-value" id="srv-ws-avgsize">-</span></div>
             <div class="server-metric"><span class="server-metric-label"><i class="bi bi-braces"></i> Средняя длина <i class="bi bi-question-circle-fill server-help" data-help="Среднее число символов в WS‑сообщениях. Индикатор: зелёный < 1200, оранжевый < 4000, красный ≥ 4000."></i></span><span class="server-metric-value" id="srv-ws-avglength">-</span></div>
+          <div class="server-metric"><span class="server-metric-label"><i class="bi bi-speedometer"></i> Скорость (msgs/sec) <i class="bi bi-question-circle-fill server-help" data-help="Среднее число сообщений в секунду за последние 10 секунд на стороне клиента (оценка по событиям Socket.IO)."></i></span><span class="server-metric-value" id="srv-ws-mps">-</span></div>
+          <div class="server-metric"><span class="server-metric-label"><i class="bi bi-hdd-network"></i> Трафик (bytes/sec) <i class="bi bi-question-circle-fill server-help" data-help="Оценка байтов в секунду по последним 10 секундам (на клиенте не всегда точна для бинарных/сжатых пакетов)."></i></span><span class="server-metric-value" id="srv-ws-bps">-</span></div>
+          <div class="server-metric"><span class="server-metric-label"><i class="bi bi-clock-history"></i> Интервал между сообщениями <i class="bi bi-question-circle-fill server-help" data-help="Средний промежуток времени между приходом WS-сообщений за последнюю минуту."></i></span><span class="server-metric-value" id="srv-ws-avgint">-</span></div>
+          <div class="server-metric"><span class="server-metric-label"><i class="bi bi-broadcast"></i> Сетевой RTT <i class="bi bi-question-circle-fill server-help" data-help="Оценка задержки. WS RTT: round-trip при пинге события. HTTP RTT: запрос к /api/health. Цвета: зелёный <80мс, оранжевый <200мс, красный ≥200мс."></i></span><span class="server-metric-value" id="srv-net-rtt">-</span></div>
           </div>
         </div>
       </div>
@@ -848,6 +1448,10 @@ class ServerInspector {
       wsRecv: panel.querySelector('#srv-ws-recv'),
       wsAvgSize: panel.querySelector('#srv-ws-avgsize'),
       wsAvgLen: panel.querySelector('#srv-ws-avglength'),
+      wsMps: panel.querySelector('#srv-ws-mps'),
+      wsBps: panel.querySelector('#srv-ws-bps'),
+      wsAvgInt: panel.querySelector('#srv-ws-avgint'),
+      netRtt: panel.querySelector('#srv-net-rtt'),
 
       sysUptime: panel.querySelector('#srv-sys-uptime'),
       sysOs: panel.querySelector('#srv-sys-os'),
@@ -858,6 +1462,21 @@ class ServerInspector {
       intervalSel: panel.querySelector('#srv-interval'),
       realtimeChk: panel.querySelector('#srv-realtime'),
       closeBtn: panel.querySelector('#srv-close-btn'),
+      memoryCleanupBtn: panel.querySelector('#srv-memory-cleanup'),
+      restartBtn: panel.querySelector('#srv-restart-btn'),
+      logsBtn: panel.querySelector('#srv-logs-btn'),
+      logsPanel: panel.querySelector('#srv-log-panel'),
+      logsClose: panel.querySelector('#srv-logs-close'),
+      logsRefresh: panel.querySelector('#srv-logs-refresh'),
+      logsClear: panel.querySelector('#srv-logs-clear'),
+      logsDownload: panel.querySelector('#srv-logs-download'),
+      logsBody: panel.querySelector('#srv-log-body'),
+      logsLevel: panel.querySelector('#srv-log-level'),
+      logsGrep: panel.querySelector('#srv-log-grep'),
+      logsLive: panel.querySelector('#srv-logs-live'),
+      logsAutoscroll: panel.querySelector('#srv-logs-autoscroll'),
+      logsToggleNew: panel.querySelector('#srv-logs-toggle-new'),
+      notifyToggleBtn: panel.querySelector('#srv-notify-toggle'),
       componentsBar: panel.querySelector('#srv-components-bar'),
       clDomTotal: panel.querySelector('#cl-dom-total'),
       clDomApp: panel.querySelector('#cl-dom-app'),
@@ -867,8 +1486,12 @@ class ServerInspector {
       clLoad: panel.querySelector('#cl-load'),
       clJsMem: panel.querySelector('#cl-js-mem'),
       clGc: panel.querySelector('#cl-gc'),
-      clGcTypes: panel.querySelector('#cl-gc-types')
+      clGcTypes: panel.querySelector('#cl-gc-types'),
+      clLongTasksCount: panel.querySelector('#cl-longtasks-count'),
+      clLongTasksRecent: panel.querySelector('#cl-longtasks-recent')
     };
+    // hand over to log subsystem
+    try { this.logs.captureElements(this.els); this.logs.initializeAfterBuild(); } catch(_) {}
     if (this.els.intervalSel) {
       this.els.intervalSel.value = String(this.checkInterval);
       this.els.intervalSel.addEventListener('change', (e) => {
@@ -909,6 +1532,67 @@ class ServerInspector {
     if (this.els.closeBtn) {
       this.els.closeBtn.addEventListener('click', () => this.hide());
     }
+    // Перезапуск сервера
+    if (this.els.restartBtn) {
+      this.els.restartBtn.addEventListener('click', async () => {
+        try {
+          if (!confirm('Перезапустить сервер? Текущая сессия будет перезапущена.')) return;
+          this.els.restartBtn.disabled = true;
+          try { this.els.restartBtn.title = 'Перезапуск...'; } catch(_) {}
+          const resp = await fetch('/api/restart', { method: 'POST', headers: { 'Content-Type':'application/json', 'X-Confirm-Restart':'yes' } });
+          if (resp.ok) {
+            this._restartInProgress = true;
+            this._showRestartOverlay();
+            this._waitForServerReborn().catch(()=>{});
+          } else {
+            if (!this.disableAllNotifications) {
+              try { showError('Перезапуск не принят сервером'); } catch(_) {}
+            }
+          }
+        } catch (e) {
+          if (!this.disableAllNotifications) {
+            try { showError('Ошибка запроса перезапуска'); } catch(_) {}
+          }
+        } finally {
+          try { this.els.restartBtn.disabled = false; this.els.restartBtn.title = 'Перезапуск сервера'; } catch(_) {}
+        }
+      });
+    }
+    // Глобальный переключатель уведомлений в шапке
+    if (this.els.notifyToggleBtn) {
+      const applyIcon = () => {
+        const iconEl = this.els.notifyToggleBtn.querySelector('i');
+        if (!iconEl) return;
+        if (this.disableAllNotifications) {
+          iconEl.className = 'bi bi-bell-slash-fill';
+          this.els.notifyToggleBtn.title = 'Уведомления выключены';
+          this.els.notifyToggleBtn.classList.add('notify-off');
+        } else {
+          iconEl.className = 'bi bi-bell-fill';
+          this.els.notifyToggleBtn.title = 'Уведомления включены';
+          this.els.notifyToggleBtn.classList.remove('notify-off');
+        }
+      };
+      applyIcon();
+      this.els.notifyToggleBtn.addEventListener('click', () => {
+        this.disableAllNotifications = !this.disableAllNotifications;
+        this._saveSetting('disableAll', this.disableAllNotifications);
+        applyIcon();
+        // Визуально и логически блокируем/разблокируем секцию уведомлений
+        try { this._applyDisableNotificationsUI(); } catch(_) {}
+      });
+    }
+    
+    // Кнопка очистки памяти
+    const memoryCleanupBtn = panel.querySelector('#srv-memory-cleanup');
+    if (memoryCleanupBtn) {
+      memoryCleanupBtn.addEventListener('click', () => {
+        this._forceMemoryCleanup();
+        if (!this.disableAllNotifications) {
+          showInfo('Память очищена');
+        }
+      });
+    }
     // Инициализируем тултипы
     try { initTooltips(); panel.querySelectorAll('.server-help').forEach((el) => attachHelpTooltip(el, el.getAttribute('data-help') || '')); } catch(_) {}
     // Аккордеоны групп
@@ -918,7 +1602,51 @@ class ServerInspector {
     // Привязываем настройки вида
     this._bindViewSettings();
     this._startClientMetricsRealtime();
+    this._startLatencyMonitoring();
+    this._startWsStatsCollection();
     this._updateClientMetrics();
+
+    // Логи: биндинг
+    this._bindLogsPanel();
+  }
+
+  _showRestartOverlay() {
+    try {
+      let ov = document.getElementById('srv-restart-overlay');
+      if (!ov) {
+        ov = document.createElement('div');
+        ov.id = 'srv-restart-overlay';
+        ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);color:#fff;display:flex;align-items:center;justify-content:center;z-index:99999;font:14px/1.4 system-ui;';
+        ov.innerHTML = '<div style="text-align:center"><div class="spinner" style="margin:auto;border:3px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;width:28px;height:28px;animation:spin 1s linear infinite"></div><div style="margin-top:10px">Идёт перезапуск сервера…</div></div>';
+        const style = document.createElement('style');
+        style.textContent='@keyframes spin{to{transform:rotate(360deg)}}';
+        document.head.appendChild(style);
+        document.body.appendChild(ov);
+      }
+    } catch(_) {}
+  }
+
+  async _waitForServerReborn() {
+    const startTs = performance.now();
+    const maxMs = 30000;
+    // Снимем текущий boot_id
+    try {
+      const r0 = await fetch('/api/health', { cache: 'no-store', credentials: 'include' });
+      const j0 = await r0.json();
+      if (j0 && j0.boot_id) this._serverBootId = this._serverBootId || j0.boot_id;
+    } catch(_){ }
+    let ok = false;
+    while (performance.now() - startTs < maxMs) {
+      try {
+        const r = await fetch('/api/health', { cache: 'no-store', credentials: 'include' });
+        if (r.ok) {
+          const j = await r.json();
+          if (j && j.boot_id && this._serverBootId && j.boot_id !== this._serverBootId) { ok = true; break; }
+        }
+      } catch(_) {}
+      await new Promise(rs=>setTimeout(rs, 700));
+    }
+    try { window.location.reload(); } catch(_) {}
   }
 
   _bindKeydown() {
@@ -940,8 +1668,11 @@ class ServerInspector {
         // Listeners
         this._onServerInfo = (payload) => this._handleServerInfo(payload);
         window.socket.on('server_info', this._onServerInfo);
+        // Событие о перезапуске от сервера
+        this._onRestarting = () => { this._restartInProgress = true; this._showRestartOverlay(); };
+        window.socket.on('server_restarting', this._onRestarting);
 
-        this._onConnect = () => { this._requestOnce(); this.realtimeEnabled ? (this._startRealtimeFallback()) : (this._restartPolling()); this._stopHttpFallback(); };
+        this._onConnect = () => { this._requestOnce(); this.realtimeEnabled ? (this._startRealtimeFallback()) : (this._restartPolling()); this._stopHttpFallback(); this._setupSocketPingPong(); this._ensureLogsBackgroundSubscription(); };
         this._onDisconnect = () => { this._stopPolling(); this._stopRealtimeFallback(); this._startHttpFallback(); };
         window.socket.on('connect', this._onConnect);
         window.socket.on('disconnect', this._onDisconnect);
@@ -998,6 +1729,7 @@ class ServerInspector {
       set('srv-tcpu-warn', this.tempCpuWarn); set('srv-tcpu-crit', this.tempCpuCrit);
       set('srv-tgpu-warn', this.tempGpuWarn); set('srv-tgpu-crit', this.tempGpuCrit);
       set('srv-notify-interval', this.notifyInterval / 1000);
+      set('srv-desktop-notify', this.desktopNotify, true);
     };
 
     const bindChange = (id, key, isBool=false) => {
@@ -1024,29 +1756,52 @@ class ServerInspector {
       });
     }
     // Disable All toggle
-    const disableAllChk = document.getElementById('srv-disable-all');
-    const blockIds = ['srv-toasts-enabled','srv-notify-interval','srv-cpu-warn','srv-cpu-crit','srv-mem-warn','srv-mem-crit','srv-tcpu-warn','srv-tcpu-crit','srv-tgpu-warn','srv-tgpu-crit'];
-    const applyDisableAll = () => {
+    const blockIds = ['srv-toasts-enabled','srv-notify-interval','srv-cpu-warn','srv-cpu-crit','srv-mem-warn','srv-mem-crit','srv-tcpu-warn','srv-tcpu-crit','srv-tgpu-warn','srv-tgpu-crit','srv-desktop-notify'];
+    this._applyDisableNotificationsUI = () => {
       const off = !!this.disableAllNotifications;
       blockIds.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.disabled = off;
-        if (el && el.closest('.srv-setting-item')) el.closest('.srv-setting-item').classList.toggle('disabled', off);
+        const wrap = el && el.closest('.srv-setting-item');
+        if (wrap) wrap.classList.toggle('disabled', off);
       });
-      const grid = (disableAllChk && disableAllChk.closest('.srv-grid'));
+      // Подпишем шапочную иконку (если есть)
+      try {
+        const btn = document.getElementById('srv-notify-toggle');
+        if (btn) {
+          const iconEl = btn.querySelector('i');
+          if (iconEl) iconEl.className = off ? 'bi bi-bell-slash-fill' : 'bi bi-bell-fill';
+          btn.title = off ? 'Уведомления выключены' : 'Уведомления включены';
+        }
+      } catch(_) {}
+      // Серая заливка для визуального блокирования сетки параметров
+      const grid = document.querySelector('#server-settings-drawer .srv-setting-group[data-key="notifications"] .srv-grid');
       if (grid) grid.classList.toggle('disabled', off);
     };
-    if (disableAllChk) {
-      disableAllChk.addEventListener('change', () => {
-        this.disableAllNotifications = !!disableAllChk.checked;
-        this._saveSetting('disableAll', this.disableAllNotifications);
-        applyDisableAll();
-      });
-    }
-    applyDisableAll();
+    this._applyDisableNotificationsUI();
     bindChange('srv-mem-warn', 'memWarn'); bindChange('srv-mem-crit', 'memCrit');
     bindChange('srv-tcpu-warn', 'tempCpuWarn'); bindChange('srv-tcpu-crit', 'tempCpuCrit');
     bindChange('srv-tgpu-warn', 'tempGpuWarn'); bindChange('srv-tgpu-crit', 'tempGpuCrit');
+    // Desktop Notifications permission flow
+    const desk = document.getElementById('srv-desktop-notify');
+    if (desk) {
+      desk.addEventListener('change', async () => {
+        const on = !!desk.checked;
+        this.desktopNotify = on;
+        this._saveSetting('desktopNotify', on);
+        if (on && ('Notification' in window)) {
+          try {
+            if (Notification.permission === 'default') {
+              await Notification.requestPermission();
+            }
+            if (Notification.permission !== 'granted') {
+              showWarning('Разрешение на уведомления не выдано');
+              desk.checked = false; this.desktopNotify = false; this._saveSetting('desktopNotify', false);
+            }
+          } catch(_) {}
+        }
+      });
+    }
     
     // Custom handler for notify interval
     const notifyIntervalInput = document.getElementById('srv-notify-interval');
@@ -1083,9 +1838,160 @@ class ServerInspector {
     ['srv-cpu-warn','srv-cpu-crit','srv-mem-warn','srv-mem-crit'].forEach(id => clampNumber(id, 1, 100));
     ['srv-tcpu-warn','srv-tcpu-crit','srv-tgpu-warn','srv-tgpu-crit'].forEach(id => clampNumber(id, 25, 120));
 
+    // Инициализация селекта уровня бэйджа логов
+    const badgeSel = document.getElementById('srv-badge-level');
+    if (badgeSel) {
+      const applySavedBadgeLevel = () => {
+        try {
+          let saved = this._loadSetting('badgeLevel', this.logsBadgeLevel || 'INFO');
+          saved = String(saved || 'INFO').toUpperCase().trim();
+          this.logsBadgeLevel = saved;
+          // Установка выбранного пункта надёжно
+          const opt = badgeSel.querySelector(`option[value="${saved}"]`);
+          if (opt) { opt.selected = true; badgeSel.value = saved; }
+          else { badgeSel.value = 'INFO'; }
+        } catch(_) {}
+      };
+      applySavedBadgeLevel();
+      // На случай гонки со стилями/рендером — повтор через тик
+      setTimeout(applySavedBadgeLevel, 0);
+      // И ещё один повтор через rAF, если браузер отложил отрисовку селекта
+      try { requestAnimationFrame(()=>applySavedBadgeLevel()); } catch(_) {}
+      badgeSel.addEventListener('change', () => {
+        const val = badgeSel.value || 'INFO';
+        this.logsBadgeLevel = val;
+        this._saveSetting('badgeLevel', val);
+        // Перезапустить фоновую подписку с новым уровнем
+        this._ensureLogsBackgroundSubscription();
+        // Сброс старого бэйджа и буфера при смене уровня
+        this._logsNewCounter = 0;
+        this._newLogsBuffer = [];
+        this._updateLogsNewBadge();
+        try { this.els?.logsToggleNew?.removeAttribute('data-badge'); } catch(_) {}
+      });
+      // Применим подписку при первичной инициализации, чтобы UI и поведение совпадали
+      try { this._ensureLogsBackgroundSubscription(); } catch(_) {}
+      // При открытии настроек синхронизируем селект ещё раз
+      try {
+        const btn = document.getElementById('srv-settings-btn');
+        if (btn) btn.addEventListener('click', () => { try { applySavedBadgeLevel(); } catch(_) {} });
+      } catch(_) {}
+      // Наблюдатель: если какой-то код поменяет value на другое, вернём сохранённое
+      try {
+        const mo = new MutationObserver(()=>{
+          const saved = String(this._loadSetting('badgeLevel', 'INFO')||'INFO').toUpperCase().trim();
+          if ((badgeSel.value||'').toUpperCase() !== saved) {
+            const opt = badgeSel.querySelector(`option[value="${saved}"]`);
+            if (opt) { opt.selected = true; badgeSel.value = saved; }
+          }
+        });
+        mo.observe(badgeSel, { attributes: true, attributeFilter: ['value'] });
+      } catch(_) {}
+    }
+    // removed 'Уровень логов при открытии' — всегда ALL
+    const logsLimitInp = document.getElementById('srv-logs-limit');
+    if (logsLimitInp) {
+      try { logsLimitInp.value = String(this.logsHttpLimit); } catch(_) {}
+      logsLimitInp.addEventListener('change', () => {
+        let v = Number(logsLimitInp.value);
+        if (!Number.isFinite(v)) return;
+        v = Math.max(100, Math.min(5000, Math.round(v)));
+        logsLimitInp.value = String(v);
+        this.logsHttpLimit = v;
+        this._saveSetting('logsLimit', v);
+      });
+    }
+    const logsNewBufInp = document.getElementById('srv-logs-newbuf');
+    if (logsNewBufInp) {
+      try { logsNewBufInp.value = String(this._newLogsMax); } catch(_) {}
+      logsNewBufInp.addEventListener('change', () => {
+        let v = Number(logsNewBufInp.value);
+        if (!Number.isFinite(v)) return;
+        v = Math.max(50, Math.min(5000, Math.round(v)));
+        logsNewBufInp.value = String(v);
+        this._newLogsMax = v;
+        this._saveSetting('logsNewBuf', v);
+        // Обрезать текущий буфер при необходимости
+        if (Array.isArray(this._newLogsBuffer) && this._newLogsBuffer.length > v) {
+          this._newLogsBuffer.splice(0, this._newLogsBuffer.length - v);
+        }
+      });
+    }
+
+    // Color pickers for logs
+    const applyLogColors = () => {
+      try {
+        const root = document.getElementById('srv-log-panel');
+        if (!root) return;
+        const cssMap = {
+          '--log-ts': this.logColors.ts,
+          '--log-ip': this.logColors.ip,
+          '--log-debug': this.logColors.debug,
+          '--log-info': this.logColors.info,
+          '--log-warning': this.logColors.warning,
+          '--log-error': this.logColors.error,
+          '--log-critical': this.logColors.critical,
+        };
+        Object.entries(cssMap).forEach(([k, v]) => { try { root.style.setProperty(k, v); } catch(_) {} });
+      } catch(_) {}
+    };
+    const bindColor = (id, key) => {
+      const el = document.getElementById(id); if (!el) return;
+      try { el.value = String(this.logColors[key] || '#ffffff'); } catch(_) {}
+      el.addEventListener('input', () => {
+        this.logColors[key] = el.value;
+        this._saveJsonSetting('logColors', this.logColors);
+        applyLogColors();
+      });
+    };
+    bindColor('srv-logc-ts', 'ts');
+    bindColor('srv-logc-ip', 'ip');
+    bindColor('srv-logc-debug', 'debug');
+    bindColor('srv-logc-info', 'info');
+    bindColor('srv-logc-warning', 'warning');
+    bindColor('srv-logc-error', 'error');
+    bindColor('srv-logc-critical', 'critical');
+    const resetBtn = document.getElementById('srv-logc-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        this.logColors = { ts:'#9aa0a6', ip:'#8ab4f8', debug:'#9aa0a6', info:'#c3e88d', warning:'#ffcb6b', error:'#ff6e6e', critical:'#ff5555' };
+        this._saveJsonSetting('logColors', this.logColors);
+        ['srv-logc-ts','srv-logc-ip','srv-logc-debug','srv-logc-info','srv-logc-warning','srv-logc-error','srv-logc-critical'].forEach(id=>{ const el=document.getElementById(id); if (el) el.value = this.logColors[id.replace('srv-logc-','')]; });
+        applyLogColors();
+      });
+    }
+    // Feature toggles and RegExp
+    const errReEl = document.getElementById('srv-logc-err-re');
+    const httpEnEl = document.getElementById('srv-logc-enable-http');
+    const uuidEnEl = document.getElementById('srv-logc-enable-uuid');
+    const errEnEl = document.getElementById('srv-logc-enable-err');
+    const logFx = this._loadJsonSetting('logFx', { http:true, uuid:true, err:true, errRe:'(Exception|Traceback|Error:|Ошибка)' });
+    if (errReEl) { errReEl.value = String(logFx.errRe || ''); errReEl.addEventListener('input', ()=>{ logFx.errRe = errReEl.value; this._saveJsonSetting('logFx', logFx); }); }
+    if (httpEnEl) { httpEnEl.checked = !!logFx.http; httpEnEl.addEventListener('change', ()=>{ logFx.http = !!httpEnEl.checked; this._saveJsonSetting('logFx', logFx); }); }
+    if (uuidEnEl) { uuidEnEl.checked = !!logFx.uuid; uuidEnEl.addEventListener('change', ()=>{ logFx.uuid = !!uuidEnEl.checked; this._saveJsonSetting('logFx', logFx); }); }
+    if (errEnEl) { errEnEl.checked = !!logFx.err; errEnEl.addEventListener('change', ()=>{ logFx.err = !!errEnEl.checked; this._saveJsonSetting('logFx', logFx); }); }
+    this._logFx = logFx;
+    // apply on open
+    applyLogColors();
+
     btn() && btn().addEventListener('click', toggle);
     btnClose() && btnClose().addEventListener('click', close);
   }
+
+  _bindLogsPanel() { try { this.logs.bindPanel(); } catch(_) {} }
+
+  _ensureLogsHandler() { try { this.logs.ensureHandler(); } catch(_) {} }
+
+  _subscribeLogs(level='INFO', grep='') { try { this.logs.subscribe(level, grep); } catch(_) {} }
+  _unsubscribeLogs() { try { this.logs.unsubscribe(); } catch(_) {} }
+
+  _ensureLogsBackgroundSubscription() { try { this.logs.ensureBackgroundSubscription(); } catch(_) {} }
+
+  _updateLogsNewBadge() { try { this.logs.updateBadge(); } catch(_) {} }
+
+  async _fetchLogsOnce() { try { await this.logs.fetchOnce(); } catch(_) {} }
+
+  _startLogsLive() { try { this.logs.startLive(); } catch(_) {} }
 
   _unbindSocket() {
     try {
@@ -1094,6 +2000,7 @@ class ServerInspector {
       if (this._onServerInfo) s.off('server_info', this._onServerInfo);
       if (this._onConnect) s.off('connect', this._onConnect);
       if (this._onDisconnect) s.off('disconnect', this._onDisconnect);
+      if (this._onAnyListener) { try { s.offAny(this._onAnyListener); } catch(_) {} }
     } catch(_) {}
   }
 
@@ -1119,19 +2026,144 @@ class ServerInspector {
 
   // HTTP fallback when WS недоступен
   _startHttpFallback() {
-    if (this._httpPollId) return;
-    this._fetchHealthOnce();
-    this._httpPollId = setInterval(() => this._fetchHealthOnce(), Math.max(10000, this.checkInterval));
+    // Переносим на setTimeout с джиттером и паузой при скрытии вкладки
+    if (this._httpPollTimeout) return;
+    const loop = () => {
+      try {
+        if (!this.isVisible || document.hidden) {
+          // при скрытии вкладки делаем редкий «тихий» пинг раз в 30с
+          this._httpPollTimeout = setTimeout(loop, 30000);
+          return;
+        }
+        this._fetchHealthOnce();
+      } catch(_) {}
+      // базовый интервал = max(checkInterval, 4000) + джиттер до 500мс
+      const base = Math.max(4000, this.checkInterval);
+      const jitter = Math.floor(Math.random() * 500);
+      this._httpPollTimeout = setTimeout(loop, base + jitter);
+    };
+    // стартуем сразу
+    loop();
   }
-  _stopHttpFallback() { if (this._httpPollId) { clearInterval(this._httpPollId); this._httpPollId = null; } }
+  _stopHttpFallback() {
+    if (this._httpPollTimeout) { clearTimeout(this._httpPollTimeout); this._httpPollTimeout = null; }
+  }
 
   async _fetchHealthOnce() {
     try {
+      // Guard: если панель скрыта, не дергаем health
+      if (!this.isVisible || !this.root || document.hidden) return;
+      if (this._healthFetchInflight) return; // не допускаем наложения запросов
+      this._healthFetchInflight = true;
       const res = await fetch('/api/health', { cache: 'no-store' });
       if (!res.ok) return;
       const data = await res.json();
-      if (data && data.components) {
-        this._renderComponents(data.components);
+      if (data && data.components) this._renderComponents(data.components);
+      if (data) this._scheduleUpdateUI(data); // UI backpressure
+    } catch(_) {}
+    finally { this._healthFetchInflight = false; }
+  }
+
+  // --- Latency monitoring (HTTP and WS) ---
+  _setupSocketPingPong() {
+    try {
+      const s = window.socket;
+      if (!s) return;
+      // встроенный ping у Socket.IO есть, но воспользуемся пользовательским событием
+      if (!this._onPong) {
+        this._onPong = (payload) => {
+          if (this._pendingRttAt) {
+            const rtt = Date.now() - this._pendingRttAt;
+            this._latencyRttMs = rtt;
+            this._pendingRttAt = null;
+            this._renderLatency();
+          }
+        };
+        try { s.off('si_pong', this._onPong); } catch(_) {}
+        s.on('si_pong', this._onPong);
+      }
+    } catch(_) {}
+  }
+  _startLatencyMonitoring() {
+    try { if (this._latencyTimerId) { clearInterval(this._latencyTimerId); this._latencyTimerId = null; } } catch(_) {}
+    // Каждые 5 сек пингуем WS и HTTP
+    this._latencyTimerId = setInterval(async () => {
+      try {
+        if (!this.isVisible) return;
+        // WS ping
+        if (window.socket && window.socket.connected) {
+          this._pendingRttAt = Date.now();
+          try { window.socket.emit('si_ping', { t: this._pendingRttAt }); } catch(_) { this._pendingRttAt = null; }
+        }
+        // HTTP ping
+        if (!this.isVisible) return;
+        const start = performance && performance.now ? performance.now() : Date.now();
+        try {
+          const resp = await fetch('/api/health', { cache: 'no-store' });
+          const end = performance && performance.now ? performance.now() : Date.now();
+          if (resp.ok) {
+            const ms = Math.max(0, Math.round((end - start)));
+            this._latencyHttpMs = ms;
+          }
+        } catch(_) {}
+        this._renderLatency();
+      } catch(_) {}
+    }, 5000);
+  }
+  _stopLatencyMonitoring() { try { if (this._latencyTimerId) { clearInterval(this._latencyTimerId); this._latencyTimerId = null; } } catch(_) {} }
+  _renderLatency() {
+    try {
+      if (!this.els || !this.els.netRtt) return;
+      const ws = this._latencyRttMs;
+      const http = this._latencyHttpMs;
+      const parts = [];
+      const fmt = (v) => (Number.isFinite(v) ? `${v} мс` : '—');
+      const colorFor = (v) => v == null ? 'default' : (v < 80 ? 'ok' : (v < 200 ? 'warn' : 'crit'));
+      const set = (el, level, text) => this._setIconValue(el, level, text);
+      if (ws != null) parts.push(`WS ${fmt(ws)}`);
+      if (http != null) parts.push(`HTTP ${fmt(http)}`);
+      const text = parts.length ? parts.join(' · ') : '—';
+      const maxV = Math.max(ws ?? 0, http ?? 0);
+      const level = colorFor(isFinite(maxV) && maxV > 0 ? maxV : null);
+      set(this.els.netRtt, level, text);
+    } catch(_) {}
+  }
+
+  // --- WS throughput/stats collection ---
+  _startWsStatsCollection() {
+    try {
+      if (!window.socket) return;
+      // Так как теперь используем серверные значения, локальный сбор отключаем,
+      // но оставляем интервалы для среднего интервала как вспомогательную метрику.
+      if (this._onAnyListener) { try { window.socket.offAny(this._onAnyListener); } catch(_) {} }
+      this._onAnyListener = (event, ...args) => {
+        try {
+          const now = Date.now();
+          if (event === 'si_ping' || event === 'si_pong') return;
+          if (this._wsLastEventTs) this._wsIntervals.push({ ts: now, d: now - this._wsLastEventTs });
+          this._wsLastEventTs = now;
+          if (this._wsIntervals.length > 600) this._wsIntervals.splice(0, this._wsIntervals.length - 600);
+        } catch(_) {}
+      };
+      try { window.socket.onAny(this._onAnyListener); } catch(_) {}
+      if (this._wsStatsTimer) { clearInterval(this._wsStatsTimer); this._wsStatsTimer = null; }
+      this._wsStatsTimer = setInterval(() => this._renderWsStats(), 2000);
+    } catch(_) {}
+  }
+  _renderWsStats() {
+    try {
+      if (!this.els) return;
+      const now = Date.now();
+      // msgs/sec и bytes/sec теперь приходят с сервера в _updateUI, здесь только интервал
+      if (this.els.wsAvgInt) {
+        const oneMinAgo = now - 60000;
+        const ints = this._wsIntervals.filter(x => x && x.d > 0 && x.ts >= oneMinAgo);
+        const avgInt = ints.length ? (ints.reduce((a, x) => a + x.d, 0) / ints.length) : null;
+        if (avgInt != null) {
+          this.els.wsAvgInt.textContent = this._formatMs(avgInt);
+        } else {
+          this.els.wsAvgInt.textContent = '-';
+        }
       }
     } catch(_) {}
   }
@@ -1147,8 +2179,19 @@ class ServerInspector {
       this._buildPanel();
     }
     
+    // Сбрасываем счетчики GC при каждом открытии
+    this._gcCount = 0;
+    this._minorGcCount = 0;
+    this._majorGcCount = 0;
+    this._lastGcTime = null;
+    this._lastMemForGc = null;
+    this._lastGcFreed = null;
+    
     // Привязываем сокеты только при показе
     this._bindSocket();
+
+    // Подписаться на DEBUG (ALL) для логов по умолчанию при открытии
+    try { if (window.socket) { if (this.logs) { this.logs.unsubscribe(); this.logs.subscribe('DEBUG',''); } } } catch(_) {}
 
     this._applyHeaderOffset();
     this.root.classList.add('open');
@@ -1156,6 +2199,20 @@ class ServerInspector {
     this._startSkeleton();
     this._applyViewSettings(); // Применяем видимость секций
     if (!this._resizeHandler) { this._resizeHandler = () => this._applyHeaderOffset(); window.addEventListener('resize', this._resizeHandler); }
+    // Пауза при скрытии вкладки: останавливаем активные опросы и метрики
+    if (!this._visHandler) {
+      this._visHandler = () => {
+        try {
+          if (document.hidden) {
+            this._stopPolling();
+            this._stopRealtimeFallback();
+          } else {
+            if (this.realtimeEnabled) this._startRealtimeFallback(); else this._restartPolling();
+          }
+        } catch(_) {}
+      };
+      try { document.addEventListener('visibilitychange', this._visHandler); } catch(_) {}
+    }
     this._requestOnce();
   }
 
@@ -1169,13 +2226,18 @@ class ServerInspector {
     this.isVisible = false;
     this._stopRealtimeFallback();
     this._stopPolling();
+    // Если панель закрыта — прекращаем HTTP health fallback, чтобы не дергать /api/health
     this._stopHttpFallback();
+    this._stopLatencyMonitoring();
     this._unbindSocket();
+    // Отписка от live логов
+    try { if (this.logs) { this.logs.unsubscribe(); } } catch(_) {}
 
     // Полностью удаляем панель из DOM при закрытии
     try { if (this.root && this.root.parentNode) this.root.parentNode.removeChild(this.root); } catch(_) {}
     this.root = null; this.els = null;
     if (this._resizeHandler) { window.removeEventListener('resize', this._resizeHandler); this._resizeHandler = null; }
+    if (this._visHandler) { try { document.removeEventListener('visibilitychange', this._visHandler); } catch(_) {} this._visHandler = null; }
     
     // Очищаем GC таймер
     try { 
@@ -1184,6 +2246,26 @@ class ServerInspector {
         this._gcDetectionTimer = null; 
       } 
     } catch(_) {}
+    
+    // Очищаем клиентские метрики
+    try {
+      if (this._clientMetricsTimer) {
+        clearInterval(this._clientMetricsTimer);
+        this._clientMetricsTimer = null;
+      }
+      if (this._clientDomObserver) {
+        this._clientDomObserver.disconnect();
+        this._clientDomObserver = null;
+      }
+    } catch(_) {}
+    
+    // Сбрасываем счетчики GC при закрытии
+    this._gcCount = 0;
+    this._minorGcCount = 0;
+    this._majorGcCount = 0;
+    this._lastGcTime = null;
+    this._lastMemForGc = null;
+    this._lastGcFreed = null;
   }
 
   _applyViewSettings() {
@@ -1213,7 +2295,7 @@ class ServerInspector {
         const key = chk.getAttribute('data-key');
         if (key) {
           this._viewSettings[key] = chk.checked;
-          this._saveSetting('viewSettings', this._viewSettings);
+          this._saveJsonSetting('viewSettings', this._viewSettings);
           this._applyViewSettings();
         }
       });
@@ -1310,15 +2392,21 @@ class ServerInspector {
     if (this.serverHistory.length > this.maxHistoryLength) this.serverHistory.shift();
 
     this._lastData = data;
-    if (Date.now() >= this._skeletonUntil) this._updateUI(data);
+    if (Date.now() >= this._skeletonUntil) this._scheduleUpdateUI(data);
     this._maybeNotify(data);
   }
 
   _updateUI(d) {
     if (!this.els) return;
 
-    // Сохраняем последние данные для health checks
-    localStorage.setItem('lastServerDataTime', Date.now().toString());
+    // Сохраняем последние данные для health checks (не чаще раза в 15 секунд)
+    try {
+      const nowTs = Date.now();
+      if (!this._lastLsSaveTs || (nowTs - this._lastLsSaveTs) > 15000) {
+        localStorage.setItem('lastServerDataTime', String(nowTs));
+        this._lastLsSaveTs = nowTs;
+      }
+    } catch(_) {}
 
     // Затем все остальные метрики
     const colorBy = (val) => val >= this.cpuCrit ? '#f44336' : (val >= this.cpuWarn ? '#ff9800' : '#6bcf7f');
@@ -1368,20 +2456,16 @@ class ServerInspector {
     if (this.els.workers) {
       const a = d.queues?.workers_active, t = d.queues?.workers_total;
       if (a != null && t != null) {
-        const level = a === t ? 'ok' : 'crit';
-        this._setIconValue(this.els.workers, level, `${a} / ${t}`);
+        // Убираем иконку — только текст
+        this.els.workers.textContent = `${a} / ${t}`;
+        // Цвет статуса воркеров отображаем в статусе компонентов (ниже)
       } else {
         this.els.workers.textContent = '-';
       }
     }
     if (this.els.workersActiveNames) {
         const names = d.queues?.active_worker_names;
-        if (names && Array.isArray(names) && names.length > 0) {
-            const level = 'ok';
-            this._setIconValue(this.els.workersActiveNames, level, names.join(', '));
-        } else {
-            this.els.workersActiveNames.textContent = '-';
-        }
+        this.els.workersActiveNames.textContent = (names && Array.isArray(names) && names.length > 0) ? names.join(', ') : '-';
     }
     if (this.els.workersLag) {
       const wlag = d.queues?.workers_lag_ms;
@@ -1479,6 +2563,25 @@ class ServerInspector {
       if (l != null) this._setIconValue(this.els.wsAvgLen, l < 1200 ? 'ok' : (l < 4000 ? 'warn' : 'crit'), `${l} симв.`);
       else this.els.wsAvgLen.textContent = '-';
     }
+    // WS speed/throughput from server (preferred)
+    if (this.els.wsMps) {
+      const mps = d.websocket?.messages_per_sec;
+      if (mps != null) {
+        const lvl = mps < 5 ? 'ok' : (mps < 20 ? 'warn' : 'crit');
+        // Без иконки — только текст
+        this.els.wsMps.textContent = Number(mps).toFixed(2);
+      } else {
+        this.els.wsMps.textContent = '-';
+      }
+    }
+    if (this.els.wsBps) {
+      const bps = d.websocket?.bytes_per_sec;
+      if (bps != null) {
+        this.els.wsBps.textContent = this._formatBytes(bps) + '/с';
+      } else {
+        this.els.wsBps.textContent = '-';
+      }
+    }
 
     // Components compact bar via helper
     try {
@@ -1516,11 +2619,28 @@ class ServerInspector {
     }
   }
 
+  _scheduleUpdateUI(d) {
+    try {
+      this._lastData = d;
+      const now = Date.now();
+      if (this._uiUpdateScheduled) return;
+      const due = Math.max(0, this._uiUpdateMinIntervalMs - (now - this._lastUiUpdateAt));
+      this._uiUpdateScheduled = true;
+      setTimeout(() => {
+        try {
+          this._uiUpdateScheduled = false;
+          this._lastUiUpdateAt = Date.now();
+          if (this._lastData) this._updateUI(this._lastData);
+        } catch(_) { this._uiUpdateScheduled = false; }
+      }, due);
+    } catch(_) {}
+  }
+
 
 
   _maybeNotify(d) {
     try {
-      if (!this.toastsEnabled || this.disableAllNotifications) return;
+      if ((!this.toastsEnabled && !this.desktopNotify) || this.disableAllNotifications) return;
       const now = Date.now();
       const canNotify = (key) => {
         if (this.notifyInterval === 0) return true;
@@ -1533,23 +2653,30 @@ class ServerInspector {
       };
 
       const onlyCrit = !!this.onlyCritical;
+      const maybeDesktop = (title, body) => {
+        try {
+          if (!this.desktopNotify) return;
+          if (!('Notification' in window)) return;
+          if (Notification.permission === 'granted') new Notification(title, { body });
+        } catch(_) {}
+      };
 
       if (d.cpu_percent >= this.cpuCrit) {
-        if (canNotify('cpuCrit')) showError(`Сервер CPU критично: ${d.cpu_percent}%`);
+        if (canNotify('cpuCrit')) { showError(`Сервер CPU критично: ${d.cpu_percent}%`); maybeDesktop('CPU критично', `CPU: ${d.cpu_percent}%`); }
       } else if (!onlyCrit && d.cpu_percent >= this.cpuWarn) {
-        if (canNotify('cpuWarn')) showWarning(`Сервер CPU высоко: ${d.cpu_percent}%`);
+        if (canNotify('cpuWarn')) { showWarning(`Сервер CPU высоко: ${d.cpu_percent}%`); }
       }
 
       if (d.memory_percent >= this.memCrit) {
-        if (canNotify('memCrit')) showError(`Сервер память критично: ${d.memory_percent}%`);
+        if (canNotify('memCrit')) { showError(`Сервер память критично: ${d.memory_percent}%`); maybeDesktop('Память критично', `RAM: ${d.memory_percent}%`); }
       } else if (!onlyCrit && d.memory_percent >= this.memWarn) {
-        if (canNotify('memWarn')) showWarning(`Сервер память высоко: ${d.memory_percent}%`);
+        if (canNotify('memWarn')) { showWarning(`Сервер память высоко: ${d.memory_percent}%`); }
       }
 
       const tCpu = d.temps?.cpu_max;
       if (Number.isFinite(tCpu)) {
         if (tCpu >= this.tempCpuCrit) {
-          if (canNotify('tCpuCrit')) showError(`CPU температура критично: ${Math.round(tCpu)}°C`);
+          if (canNotify('tCpuCrit')) { showError(`CPU температура критично: ${Math.round(tCpu)}°C`); maybeDesktop('CPU перегрев', `${Math.round(tCpu)}°C`); }
         } else if (!onlyCrit && tCpu >= this.tempCpuWarn) {
           if (canNotify('tCpuWarn')) showWarning(`CPU температура высокая: ${Math.round(tCpu)}°C`);
         }
@@ -1557,7 +2684,7 @@ class ServerInspector {
       const tGpu = d.temps?.gpu_max;
       if (Number.isFinite(tGpu)) {
         if (tGpu >= this.tempGpuCrit) {
-          if (canNotify('tGpuCrit')) showError(`GPU температура критично: ${Math.round(tGpu)}°C`);
+          if (canNotify('tGpuCrit')) { showError(`GPU температура критично: ${Math.round(tGpu)}°C`); maybeDesktop('GPU перегрев', `${Math.round(tGpu)}°C`); }
         } else if (!onlyCrit && tGpu >= this.tempGpuWarn) {
           if (canNotify('tGpuWarn')) showWarning(`GPU температура высокая: ${Math.round(tGpu)}°C`);
         }
