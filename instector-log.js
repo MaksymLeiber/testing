@@ -13,7 +13,7 @@ export class ServerInspectorLogs {
   // Initialization from index after panel build
   initializeAfterBuild() {
     try { 
-      if (this.main && this.main.els) {
+      if (this.main && this.main.els && this.main.els.logsBtn) {
         this.bindPanel(); 
       }
     } catch (e) {}
@@ -47,11 +47,12 @@ export class ServerInspectorLogs {
         }
       }
       
-      // Reset rendered flag for log panel
+      // Reset rendered flag for log panel and clear content
       try {
         const host = document.getElementById('srv-log-panel');
-        if (host && host._rendered) {
+        if (host) {
           host._rendered = false;
+          host.innerHTML = '';
         }
       } catch(_) {}
       
@@ -61,7 +62,7 @@ export class ServerInspectorLogs {
 
   // Helper method to safely add event listeners with cleanup tracking
   _addEventListener(element, event, handler) {
-    if (!element || !element.addEventListener) return;
+    if (!element || !element.addEventListener || !element.parentNode) return;
     element.addEventListener(event, handler);
     // Store handler with event type for proper cleanup
     this._eventHandlers.set(element, { handler, event });
@@ -72,10 +73,8 @@ export class ServerInspectorLogs {
     const self = this.main;
     if (!self || !self.els) return; // Ensure main inspector is available
     
-    if (this._bound) {
-      // Clean up existing handlers before rebinding
-      this.cleanup();
-    }
+    // Always clean up existing handlers before rebinding
+    this.cleanup();
     // Render log panel structure inside container
     const host = document.getElementById('srv-log-panel');
     if (!host) {
